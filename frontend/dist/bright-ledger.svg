@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 120" role="img" aria-labelledby="title desc">
+  <title id="title">Bright Ledger</title>
+  <desc id="desc">A rising sun above a solar panel grid with the words Bright Ledger.</desc>
+  <defs>
+    <linearGradient id="sun" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#ffd34e"/>
+      <stop offset="1" stop-color="#d69b28"/>
+    </linearGradient>
+    <clipPath id="circle"><circle cx="52" cy="51" r="39"/></clipPath>
+  </defs>
+  <circle cx="52" cy="51" r="42" fill="none" stroke="url(#sun)" stroke-width="3.5"/>
+  <g stroke="#efbb36" stroke-width="3" stroke-linecap="round">
+    <path d="M52 8v10M29 15l5 9M15 31l10 5M75 15l-5 9M89 31l-10 5M10 48h10M84 48h10"/>
+  </g>
+  <g clip-path="url(#circle)">
+    <path d="M20 51a32 32 0 0 1 64 0H20Z" fill="url(#sun)"/>
+    <path d="M7 51h90" stroke="#b57b26" stroke-width="3"/>
+    <path d="M8 56h88l-8 37H10Z" fill="#12483d"/>
+    <path d="M22 57l19 36M51 56l10 37M80 56l-1 37M11 73h75M10 86h80" fill="none" stroke="#f4f3e9" stroke-width="2"/>
+  </g>
+  <text x="113" y="61" fill="#103b34" font-family="Georgia, 'Times New Roman', serif" font-size="42" letter-spacing="-1.6">Bright Ledger</text>
+  <text x="116" y="87" fill="#466b5a" font-family="Arial, sans-serif" font-size="10" letter-spacing="3.15">CLEAN ENERGY. REAL VALUE.</text>
+</svg>
