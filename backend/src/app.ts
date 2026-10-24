@@ -90,10 +90,10 @@ api.post('/api/auth/nonce', createWalletNonce)
 api.post('/api/auth/verify', verifyWalletSignature)
 api.use('/api', requireAuth)
 
-api.delete('/api/auth/session', revokeCurrentSession)
 api.get('/api/me', (request, response) => {
-  response.json({ id: request.user!.id, displayName: request.user!.displayName, role: request.user!.role, walletAddress: request.user!.walletAddress, demo: Boolean(request.user!.demoKey) })
+  response.json({ id: request.user!.id, displayName: request.user!.displayName, role: request.user!.role, walletAddress: request.user!.walletAddress })
 })
+api.delete('/api/auth/session', revokeCurrentSession)
 api.post('/api/auth/account-removal-challenge', createAccountRemovalChallenge)
 api.delete('/api/me', removeWalletAccount)
 
@@ -103,13 +103,14 @@ api.get('/api/config', (_request, response) => {
 
 api.get('/api/bootstrap', asyncRoute(async (request, response) => {
   const userId = request.user!.id
-  const [listings, trades, evidence, projects, points, contributions, activity, balance] = await Promise.all([
+  const [listings, trades, evidence, projects, points, contributions, activity, notifications] = await Promise.all([
     query(
       `SELECT l.public_id AS id,l.type,u.display_name AS owner,l.owner_id=$1 AS "isMine",
         l.available_kwh AS quantity,l.price_per_kwh AS price,l.service_area AS area,l.renewable_source AS source,
         l.delivery_start AS "deliveryStart",l.delivery_end AS "deliveryEnd",l.status,l.note
        FROM listings l JOIN users u ON u.id=l.owner_id
-       WHERE l.status IN ('open','matched') OR (l.owner_id=$1 AND l.status='paused')
+       WHERE u.wallet_address IS NOT NULL AND u.demo_key IS NULL
+         AND (l.status IN ('open','matched') OR (l.owner_id=$1 AND l.status='paused'))
        ORDER BY l.created_at DESC LIMIT 100`,
       [userId],
     ),
@@ -119,9 +120,9 @@ api.get('/api/bootstrap', asyncRoute(async (request, response) => {
         t.price_per_kwh AS price,t.status,t.created_at AS "createdAt",t.chain_tx_hash AS "chainTxHash",
         coalesce((SELECT count(*) FROM trade_confirmations c WHERE c.trade_id=t.id),0)::int AS confirmations
        FROM trades t JOIN users b ON b.id=t.buyer_id JOIN users s ON s.id=t.seller_id
-       WHERE t.buyer_id=$1 OR t.seller_id=$1 OR $2
+       WHERE t.buyer_id=$1 OR t.seller_id=$1
        ORDER BY t.created_at DESC LIMIT 100`,
-      [userId, Boolean(request.user!.demoKey)],
+      [userId],
     ),
     query(
       `SELECT e.public_id AS id,'Energy evidence · ' || s.display_name AS project,e.source,e.quantity_kwh AS quantity,
@@ -132,36 +133,44 @@ api.get('/api/bootstrap', asyncRoute(async (request, response) => {
         air.id AS "aiReviewId",air.model AS "aiModel",air.analysis AS "aiReview"
        FROM evidence e JOIN trades t ON t.id=e.trade_id JOIN users s ON s.id=e.submitter_id
        LEFT JOIN ai_evidence_reviews air ON air.id=e.ai_review_id
-       WHERE t.buyer_id=$1 OR t.seller_id=$1 OR $2 OR $3
+       WHERE s.wallet_address IS NOT NULL AND s.demo_key IS NULL
+         AND (t.buyer_id=$1 OR t.seller_id=$1 OR $2)
        ORDER BY e.created_at DESC LIMIT 100`,
-      [userId, Boolean(request.user!.demoKey), ['verifier', 'admin'].includes(request.user!.role)],
+      [userId, ['verifier', 'admin'].includes(request.user!.role)],
     ),
     query(
       `SELECT p.public_id AS id,p.name,p.location,p.site_type AS "siteType",u.display_name AS owner,
         p.usable_area_m2 AS area,p.capacity_kw AS capacity,p.funding_target AS target,
-        coalesce(sum(c.amount) FILTER (WHERE c.status IN ('simulated','confirmed')),0) AS raised,
+        estimate.ai_model AS "estimateModel",estimate.estimate->>'methodology' AS "fundingMethodology",
+        estimate.ai_analysis->>'summary' AS "estimateReviewSummary",
+        estimate.ai_analysis->>'confidence' AS "estimateReviewConfidence",
+        estimate.estimate->>'limitation' AS "estimateLimitation",
+        coalesce(sum(c.amount) FILTER (WHERE c.status IN ('simulated','confirmed','pledged')),0) AS raised,
         p.permission_status AS permission,p.notes,p.status,
-        fe.ai_model AS "fundingAiModel",fe.ai_analysis->>'summary' AS "fundingAiSummary",
-        fe.ai_analysis->>'confidence' AS "fundingAiConfidence",
-        count(c.id) FILTER (WHERE c.status IN ('simulated','confirmed'))::int AS "contributionCount"
-       FROM projects p JOIN users u ON u.id=p.owner_id
-       JOIN solar_funding_estimates fe ON fe.project_id=p.id
-       LEFT JOIN contributions c ON c.project_id=p.id
-       GROUP BY p.id,u.display_name,fe.id ORDER BY p.created_at DESC LIMIT 100`,
+        count(c.id) FILTER (WHERE c.status IN ('simulated','confirmed','pledged'))::int AS "contributionCount"
+       FROM projects p
+       JOIN solar_funding_estimates estimate ON estimate.project_id=p.id
+         AND estimate.ai_analysis ? 'summary' AND estimate.estimate ? 'requiredFundingMinor'
+       JOIN users u ON u.id=p.owner_id LEFT JOIN contributions c ON c.project_id=p.id
+       GROUP BY p.id,u.display_name,estimate.id ORDER BY p.created_at DESC LIMIT 100`,
     ),
     query<{ points: string }>('SELECT coalesce(sum(points),0)::text AS points FROM rewards WHERE user_id=$1', [userId]),
     query(
       `SELECT c.public_id AS id,p.public_id AS "projectId",u.display_name AS contributor,c.amount,c.created_at AS "createdAt",c.status
        FROM contributions c JOIN projects p ON p.id=c.project_id JOIN users u ON u.id=c.contributor_id
-       WHERE c.contributor_id=$1 OR $2 ORDER BY c.created_at DESC LIMIT 100`,
-      [userId, Boolean(request.user!.demoKey)],
+       WHERE c.contributor_id=$1 ORDER BY c.created_at DESC LIMIT 100`,
+      [userId],
     ),
     query(
       `SELECT e.event_type AS title,e.entity_type AS "entityType",e.entity_id AS detail,e.created_at AS "createdAt",e.source
-       FROM audit_events e WHERE e.actor_id=$1 OR $2 ORDER BY e.created_at DESC LIMIT 100`,
-      [userId, Boolean(request.user!.demoKey)],
+       FROM audit_events e WHERE e.actor_id=$1 ORDER BY e.created_at DESC LIMIT 100`,
+      [userId],
     ),
-    query<{ demoBalance: string }>('SELECT demo_balance AS "demoBalance" FROM users WHERE id=$1', [userId]),
+    query(
+      `SELECT id,title,detail,page,read_at AS "readAt",created_at AS "createdAt"
+       FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50`,
+      [userId],
+    ),
   ])
   response.json({
     listings: listings.rows.map((row) => ({ ...row, quantity: Number(row.quantity), price: Number(row.price), window: `${new Date(row.deliveryStart).toLocaleDateString('en-US', { weekday: 'short', hour: '2-digit', minute: '2-digit' })}–${new Date(row.deliveryEnd).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}` })),
@@ -170,9 +179,23 @@ api.get('/api/bootstrap', asyncRoute(async (request, response) => {
     projects: projects.rows.map((row, index) => ({ ...row, area: Number(row.area), capacity: Number(row.capacity), target: Number(row.target), raised: Number(row.raised), image: ['sunrise', 'courtyard', 'hub'][index % 3] })),
     contributions: contributions.rows.map((row) => ({ ...row, amount: Number(row.amount), time: new Date(row.createdAt).toLocaleDateString('en-US', { dateStyle: 'medium' }) })),
     points: Number(points.rows[0]?.points ?? 0),
-    demoBalance: Number(balance.rows[0]?.demoBalance ?? 0),
     activity: activity.rows.map((row) => ({ title: row.title.replaceAll('.', ' '), detail: row.detail, time: new Date(row.createdAt).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }), source: row.source })),
+    notifications: notifications.rows,
   })
+}))
+
+api.patch('/api/notifications/:id/read', asyncRoute(async (request, response) => {
+  const result = await query(
+    'UPDATE notifications SET read_at=coalesce(read_at,now()) WHERE id=$1 AND user_id=$2 RETURNING id,read_at AS "readAt"',
+    [routeId(request), request.user!.id],
+  )
+  if (!result.rowCount) throw new HttpError(404, 'Notification not found.', 'NOTIFICATION_NOT_FOUND')
+  response.json({ data: result.rows[0] })
+}))
+
+api.post('/api/notifications/read-all', asyncRoute(async (request, response) => {
+  const result = await query('UPDATE notifications SET read_at=coalesce(read_at,now()) WHERE user_id=$1 AND read_at IS NULL', [request.user!.id])
+  response.json({ data: { updated: result.rowCount ?? 0 } })
 }))
 
 api.get('/api/listings', asyncRoute(async (request, response) => {
@@ -184,7 +207,8 @@ api.get('/api/listings', asyncRoute(async (request, response) => {
       l.price_per_kwh AS price,l.service_area AS area,l.renewable_source AS source,l.status,
       l.delivery_start AS "deliveryStart",l.delivery_end AS "deliveryEnd"
      FROM listings l JOIN users u ON u.id=l.owner_id
-     WHERE l.status='open' AND ($1::text IS NULL OR l.type=$1) AND ($2::text IS NULL OR l.service_area ILIKE '%' || $2 || '%')
+     WHERE l.status='open' AND u.wallet_address IS NOT NULL AND u.demo_key IS NULL
+       AND ($1::text IS NULL OR l.type=$1) AND ($2::text IS NULL OR l.service_area ILIKE '%' || $2 || '%')
      ORDER BY CASE WHEN l.type='offer' THEN l.price_per_kwh END ASC, l.created_at DESC LIMIT $3`,
     [type ?? null, area ?? null, limit],
   )
@@ -245,7 +269,9 @@ api.post('/api/trades', asyncRoute(async (request, response) => {
     const listingResult = await client.query(
       `SELECT l.id,l.public_id AS "publicId",l.type,l.owner_id AS "ownerId",l.available_kwh AS available,
         l.price_per_kwh AS price,l.service_area AS area,l.delivery_start AS "deliveryStart",l.delivery_end AS "deliveryEnd"
-       FROM listings l WHERE public_id=$1 AND status='open' FOR UPDATE`,
+       FROM listings l JOIN users owner ON owner.id=l.owner_id
+       WHERE l.public_id=$1 AND l.status='open' AND owner.wallet_address IS NOT NULL AND owner.demo_key IS NULL
+       FOR UPDATE OF l`,
       [input.listingId],
     )
     const listing = listingResult.rows[0]
@@ -284,6 +310,7 @@ api.post('/api/trades', asyncRoute(async (request, response) => {
       await client.query('UPDATE listings SET available_kwh=$2::numeric,status=CASE WHEN $2::numeric=0 THEN $3 ELSE status END WHERE id=$1', [sellerListing.id, sellerRemaining, 'matched'])
     }
     await writeAudit(client, request.user!.id, 'trade.match_proposed', 'trade', tradeId, { quantityKwh: input.quantity, indicativeTotal: Math.round(input.quantity * price * 100) / 100 })
+    await writeNotification(client, listing.ownerId, `trade:${tradeId}:proposed`, 'New trade proposal', `${tradeId} · ${input.quantity} kWh awaits your response.`, 'Trades')
     return trade.rows[0]
   })
   response.status(201).json({ data: { ...result, buyer: listingParticipantName('buyer', request.user!, listingType(request.body)), seller: listingParticipantName('seller', request.user!, listingType(request.body)), quantity: Number(result.quantity), price: Number(result.price) } })
@@ -306,6 +333,8 @@ api.post('/api/trades/:id/confirm', asyncRoute(async (request, response) => {
       : confirmations.rows[0].count >= 2 ? 'evidence_needed' : 'awaiting_confirmation'
     await client.query('UPDATE trades SET status=$2,updated_at=now() WHERE id=$1', [row.id, status])
     await writeAudit(client, request.user!.id, 'trade.participant_confirmed', 'trade', routeId(request), { confirmations: confirmations.rows[0].count })
+    const otherPartyId = row.buyerId === request.user!.id ? row.sellerId : row.buyerId
+    await writeNotification(client, otherPartyId, `trade:${routeId(request)}:confirmed:${request.user!.id}`, 'Trade terms confirmed', `${routeId(request)} · ${confirmations.rows[0].count}/2 participants confirmed.`, 'Trades')
     return { status, confirmations: confirmations.rows[0].count }
   })
   response.json({ data: result })
@@ -382,8 +411,8 @@ api.post('/api/trades/:id/evidence', receiveEvidenceUpload, asyncRoute(async (re
   }
   if (new Date(input.intervalEnd) <= new Date(input.intervalStart)) throw new HttpError(400, 'Evidence interval end must follow its start.', 'INVALID_INTERVAL')
   const evidence = await transaction(async (client) => {
-    const tradeResult = await client.query<{ id: string; publicId: string; sellerId: string; quantity: string; status: string }>(
-      'SELECT id,public_id AS "publicId",seller_id AS "sellerId",quantity_kwh AS quantity,status FROM trades WHERE public_id=$1 FOR UPDATE',
+    const tradeResult = await client.query<{ id: string; publicId: string; buyerId: string; sellerId: string; quantity: string; status: string }>(
+      'SELECT id,public_id AS "publicId",buyer_id AS "buyerId",seller_id AS "sellerId",quantity_kwh AS quantity,status FROM trades WHERE public_id=$1 FOR UPDATE',
       [request.params.id],
     )
     const trade = tradeResult.rows[0]
@@ -439,6 +468,13 @@ api.post('/api/trades/:id/evidence', receiveEvidenceUpload, asyncRoute(async (re
       )
     }
     await client.query("UPDATE trades SET status='under_review',updated_at=now() WHERE id=$1", [trade.id])
+    await writeNotification(client, trade.buyerId, `evidence:${publicId}:submitted`, 'Delivery evidence submitted', `${trade.publicId} · ${input.quantity} kWh awaits an authorized review.`, 'Evidence')
+    const reviewers = await client.query<{ id: string }>(
+      `SELECT id FROM users WHERE role IN ('verifier','admin') AND wallet_address IS NOT NULL AND demo_key IS NULL`,
+    )
+    for (const reviewer of reviewers.rows) {
+      await writeNotification(client, reviewer.id, `evidence:${publicId}:review-required`, 'Evidence awaiting review', `${trade.publicId} · ${input.quantity} kWh`, 'Evidence')
+    }
     await writeAudit(client, request.user!.id, 'evidence.submitted', 'trade', trade.publicId, { evidenceId: publicId, quantityKwh: input.quantity, source: input.source, evidenceHash, fileAttached: Boolean(uploadedFile), evidenceFileSha256: evidenceFileSha256 ?? null })
     return inserted.rows[0]
   })
@@ -514,8 +550,8 @@ api.post('/api/evidence/:id/review', allowRoles('verifier', 'admin'), asyncRoute
   }
   if (input.decision === 'reject' && !input.reason) throw new HttpError(400, 'A rejection reason is required.', 'REJECTION_REASON_REQUIRED')
   const result = await transaction(async (client) => {
-    const current = await client.query<{ id: string; tradeId: string; tradePublicId: string; submitterId: string; status: string; quantity: string }>(
-      `SELECT e.id,e.trade_id AS "tradeId",t.public_id AS "tradePublicId",e.submitter_id AS "submitterId",e.status,e.quantity_kwh AS quantity
+    const current = await client.query<{ id: string; tradeId: string; tradePublicId: string; buyerId: string; sellerId: string; submitterId: string; status: string; quantity: string }>(
+      `SELECT e.id,e.trade_id AS "tradeId",t.public_id AS "tradePublicId",t.buyer_id AS "buyerId",t.seller_id AS "sellerId",e.submitter_id AS "submitterId",e.status,e.quantity_kwh AS quantity
        FROM evidence e JOIN trades t ON t.id=e.trade_id WHERE e.public_id=$1 FOR UPDATE OF e,t`,
       [request.params.id],
     )
@@ -539,6 +575,11 @@ api.post('/api/evidence/:id/review', allowRoles('verifier', 'admin'), asyncRoute
     }
     await client.query('UPDATE evidence SET status=$2,reviewer_id=$3,rejection_reason=$4,reviewed_at=now(),chain_tx_hash=$5 WHERE id=$1', [evidence.id, status, request.user!.id, input.reason ?? null, input.chainTransactionHash ?? null])
     await client.query('UPDATE trades SET status=$2,updated_at=now() WHERE id=$1', [evidence.tradeId, input.decision === 'approve' ? 'ready_to_settle' : 'disputed'])
+    for (const userId of new Set([evidence.buyerId, evidence.sellerId])) {
+      if (userId !== request.user!.id) {
+        await writeNotification(client, userId, `evidence:${request.params.id}:reviewed`, `Evidence ${status}`, `${evidence.tradePublicId} · ${input.decision === 'approve' ? 'approved' : 'rejected'} by an authorized reviewer.`, 'Evidence')
+      }
+    }
     await writeAudit(client, request.user!.id, input.decision === 'approve' ? 'evidence.approved' : 'evidence.rejected', 'trade', evidence.tradePublicId, { evidenceId: request.params.id, reason: input.reason })
     return { evidenceId: request.params.id, tradeId: evidence.tradePublicId, status }
   })
@@ -576,7 +617,7 @@ api.post('/api/trades/:id/settle', asyncRoute(async (request, response) => {
     await client.query("UPDATE trades SET status='settled',updated_at=now() WHERE id=$1", [trade.id])
     await client.query('INSERT INTO rewards(trade_id,user_id,points) VALUES($1,$2,$3),($1,$4,$3) ON CONFLICT(trade_id,user_id) DO NOTHING', [trade.id, trade.sellerId, points, trade.buyerId])
     await writeAudit(client, request.user!.id, 'trade.settled', 'trade', trade.publicId, { quantityKwh: Number(trade.quantity), pointsPerParticipant: points, simulated: !chainBacked })
-    return { tradeId: trade.publicId, status: 'settled', pointsPerParticipant: points, settlementMode: chainBacked ? 'blockchain' : 'database-demo' }
+    return { tradeId: trade.publicId, status: 'settled', pointsPerParticipant: points, settlementMode: chainBacked ? 'blockchain' : 'database' }
   })
   response.json({ data: settlement })
 }))
@@ -585,21 +626,26 @@ api.get('/api/projects', asyncRoute(async (_request, response) => {
   const result = await query(
     `SELECT p.public_id AS id,p.name,p.location,p.site_type AS "siteType",u.display_name AS owner,
       p.usable_area_m2 AS area,p.capacity_kw AS capacity,p.funding_target AS target,
-      coalesce(sum(c.amount) FILTER (WHERE c.status IN ('simulated','confirmed')),0) AS raised,
+      estimate.ai_model AS "estimateModel",estimate.estimate->>'methodology' AS "fundingMethodology",
+      estimate.ai_analysis->>'summary' AS "estimateReviewSummary",
+      estimate.ai_analysis->>'confidence' AS "estimateReviewConfidence",
+      estimate.estimate->>'limitation' AS "estimateLimitation",
+      coalesce(sum(c.amount) FILTER (WHERE c.status IN ('simulated','confirmed','pledged')),0) AS raised,
       p.permission_status AS permission,p.notes,p.status,p.agreement_version AS "agreementVersion",
-      p.energy_share_json AS "energyShares",p.revenue_share_json AS "revenueShares",
-      fe.id AS "fundingEstimateId",fe.ai_model AS "fundingAiModel",
-      fe.ai_analysis->>'summary' AS "fundingAiSummary",
-      fe.ai_analysis->>'confidence' AS "fundingAiConfidence"
-     FROM projects p JOIN users u ON u.id=p.owner_id
-     JOIN solar_funding_estimates fe ON fe.project_id=p.id
-     LEFT JOIN contributions c ON c.project_id=p.id
-     GROUP BY p.id,u.display_name,fe.id ORDER BY p.created_at DESC`,
+      p.energy_share_json AS "energyShares",p.revenue_share_json AS "revenueShares"
+     FROM projects p
+     JOIN solar_funding_estimates estimate ON estimate.project_id=p.id
+       AND estimate.ai_analysis ? 'summary' AND estimate.estimate ? 'requiredFundingMinor'
+     JOIN users u ON u.id=p.owner_id LEFT JOIN contributions c ON c.project_id=p.id
+     GROUP BY p.id,u.display_name,estimate.id ORDER BY p.created_at DESC`,
   )
   response.json({ data: result.rows })
 }))
 
 api.post('/api/projects', asyncRoute(async (request, response) => {
+  if (!['space_owner', 'admin'].includes(request.user!.role)) {
+    throw new HttpError(403, 'Choose an energy-host profile to submit a community solar site.', 'ROLE_NOT_ALLOWED')
+  }
   const input = z.object({
     name: z.string().trim().min(3).max(120),
     location: z.string().trim().min(2).max(160),
@@ -617,24 +663,31 @@ api.post('/api/projects', asyncRoute(async (request, response) => {
   const publicId = `PRJ-${randomUUID().slice(0, 8).toUpperCase()}`
   const result = await transaction(async (client) => {
     {
-      const estimate = await client.query<{ requiredFundingMinor: string; usableAreaM2: number; location: string; siteType: string; revenueSharesMatch: boolean }>(
+      const estimate = await client.query<{ requiredFundingMinor: string; usableAreaM2: number; aiModel: string; estimatedLocation: string; estimatedSiteType: string; estimatedShares: Record<string, number> }>(
         `SELECT (estimate->>'requiredFundingMinor')::bigint AS "requiredFundingMinor",
-          (estimate->>'usableAreaM2')::numeric AS "usableAreaM2",
-          input->>'location' AS location,input->>'siteType' AS "siteType",
-          input->'revenueShares' = $3::jsonb AS "revenueSharesMatch"
+          (estimate->>'usableAreaM2')::numeric AS "usableAreaM2",ai_model AS "aiModel",
+          input->>'location' AS "estimatedLocation",input->>'siteType' AS "estimatedSiteType",
+          input->'revenueShares' AS "estimatedShares"
          FROM solar_funding_estimates
          WHERE id=$1 AND created_by=$2 AND project_id IS NULL
+           AND ai_analysis ? 'summary' AND estimate ? 'requiredFundingMinor'
          FOR UPDATE`,
-        [input.fundingEstimateId, request.user!.id, JSON.stringify(input.revenueShares)],
+        [input.fundingEstimateId, request.user!.id],
       )
       const savedEstimate = estimate.rows[0]
       if (!savedEstimate) throw new HttpError(404, 'Funding estimate not found or already used.', 'FUNDING_ESTIMATE_NOT_FOUND')
-      if (Number(savedEstimate.usableAreaM2) !== input.area
-        || Number(savedEstimate.requiredFundingMinor) !== Math.round(input.target * 100)
-        || savedEstimate.location !== input.location
-        || savedEstimate.siteType !== input.siteType
-        || !savedEstimate.revenueSharesMatch) {
-        throw new HttpError(409, 'Project location, site type, area, target, and revenue shares must match the saved AI-reviewed estimate.', 'FUNDING_ESTIMATE_MISMATCH')
+      if (!savedEstimate.aiModel.trim()) throw new HttpError(409, 'A completed AI-reviewed estimate is required before publishing a solar project.', 'FUNDING_ESTIMATE_INCOMPLETE')
+      const estimatedShares = savedEstimate.estimatedShares
+      if (
+        Number(savedEstimate.usableAreaM2) !== input.area ||
+        Number(savedEstimate.requiredFundingMinor) !== Math.round(input.target * 100) ||
+        savedEstimate.estimatedLocation.trim().toLowerCase() !== input.location.trim().toLowerCase() ||
+        savedEstimate.estimatedSiteType.trim().toLowerCase() !== input.siteType.trim().toLowerCase() ||
+        estimatedShares?.owner !== input.revenueShares.owner ||
+        estimatedShares?.funder !== input.revenueShares.funder ||
+        estimatedShares?.community !== input.revenueShares.community
+      ) {
+        throw new HttpError(409, 'Project location, site type, area, funding target, and revenue shares must match the AI-reviewed estimate.', 'FUNDING_ESTIMATE_MISMATCH')
       }
     }
     const project = await client.query(
@@ -645,32 +698,46 @@ api.post('/api/projects', asyncRoute(async (request, response) => {
     )
     await client.query('INSERT INTO agreements(project_id,version,energy_share_json,revenue_share_json,created_by) SELECT id,1,$2,$3,$4 FROM projects WHERE public_id=$1', [publicId, JSON.stringify(input.energyShares), JSON.stringify(input.revenueShares), request.user!.id])
     await client.query('UPDATE solar_funding_estimates SET project_id=(SELECT id FROM projects WHERE public_id=$2) WHERE id=$1', [input.fundingEstimateId, publicId])
-    await writeAudit(client, request.user!.id, 'project.created', 'project', publicId, { permission: input.permission, fundingEstimateId: input.fundingEstimateId })
+    await writeAudit(client, request.user!.id, 'project.created', 'project', publicId, { permission: input.permission, fundingEstimateId: input.fundingEstimateId ?? null })
+    await writeNotification(client, request.user!.id, `project:${publicId}:submitted`, 'Solar project submitted', `${publicId} · awaiting independent site review.`, 'Solar projects')
+    const reviewers = await client.query<{ id: string }>(
+      `SELECT id FROM users WHERE role IN ('verifier','admin') AND wallet_address IS NOT NULL AND demo_key IS NULL`,
+    )
+    for (const reviewer of reviewers.rows) {
+      await writeNotification(client, reviewer.id, `project:${publicId}:review-required`, 'Solar site awaiting review', `${publicId} · ${input.name}`, 'Solar projects')
+    }
     return project.rows[0]
   })
   response.status(201).json({ data: { ...result, owner: request.user!.displayName, raised: 0 } })
 }))
 
-api.post('/api/projects/:id/decision', allowRoles('verifier', 'admin'), asyncRoute(async (request, response) => {
-  const input = z.object({ decision: z.enum(['approve', 'reject']) }).parse(request.body)
+api.post('/api/projects/:id/review', allowRoles('verifier', 'admin'), asyncRoute(async (request, response) => {
+  const input = z.object({
+    decision: z.enum(['approve', 'reject']),
+    reason: z.string().trim().min(4).max(500).optional(),
+  }).parse(request.body)
+  if (input.decision === 'reject' && !input.reason) {
+    throw new HttpError(400, 'A reason is required when rejecting a solar site.', 'REJECTION_REASON_REQUIRED')
+  }
   const result = await transaction(async (client) => {
-    const project = await client.query<{ id: string; status: string }>(
-      'SELECT id,status FROM projects WHERE public_id=$1 FOR UPDATE',
+    const project = await client.query<{ id: string; publicId: string; ownerId: string; name: string; status: string }>(
+      'SELECT id,public_id AS "publicId",owner_id AS "ownerId",name,status FROM projects WHERE public_id=$1 FOR UPDATE',
       [routeId(request)],
     )
     const row = project.rows[0]
     if (!row) throw new HttpError(404, 'Project not found.', 'PROJECT_NOT_FOUND')
-    if (row.status !== 'review') throw new HttpError(409, 'Only projects awaiting review can receive a decision.', 'PROJECT_NOT_AWAITING_REVIEW')
+    if (row.ownerId === request.user!.id) throw new HttpError(403, 'A project owner cannot review their own site.', 'SELF_REVIEW')
+    if (row.status !== 'review') throw new HttpError(409, 'Only a project awaiting review can be approved or rejected.', 'INVALID_PROJECT_STATE')
     const status = input.decision === 'approve' ? 'funding' : 'rejected'
-    const eventType = input.decision === 'approve' ? 'project.approved' : 'project.rejected'
     await client.query('UPDATE projects SET status=$2 WHERE id=$1', [row.id, status])
-    await writeAudit(client, request.user!.id, eventType, 'project', routeId(request))
-    return { id: routeId(request), status }
+    await writeAudit(client, request.user!.id, input.decision === 'approve' ? 'project.approved' : 'project.rejected', 'project', row.publicId, { reason: input.reason ?? null })
+    await writeNotification(client, row.ownerId, `project:${row.publicId}:reviewed`, `Solar site ${status}`, `${row.publicId} · ${input.reason ?? 'Independent review completed.'}`, 'Solar projects')
+    return { projectId: row.publicId, status }
   })
   response.json({ data: result })
 }))
 
-api.post('/api/projects/funding-estimates', allowRoles('prosumer', 'consumer', 'both', 'space_owner', 'admin'), asyncRoute(async (request, response) => {
+api.post('/api/projects/funding-estimates', allowRoles('space_owner', 'admin'), asyncRoute(async (request, response) => {
   if (request.body?.consentToAi !== true) {
     throw new HttpError(400, 'Confirm that this project information may be sent to the configured AI provider.', 'AI_REVIEW_CONSENT_REQUIRED')
   }
@@ -701,28 +768,37 @@ api.post('/api/projects/funding-estimates', allowRoles('prosumer', 'consumer', '
 api.post('/api/projects/:id/contributions', asyncRoute(async (request, response) => {
   const input = z.object({ amount: z.number().positive().max(100_000_000), idempotencyKey: z.string().uuid() }).parse(request.body)
   const result = await transaction(async (client) => {
-    const existing = await client.query('SELECT public_id AS id,amount,project_id FROM contributions WHERE idempotency_key=$1', [input.idempotencyKey])
-    if (existing.rowCount) return { ...existing.rows[0], duplicate: true }
-    const project = await client.query<{ id: string; target: string; status: string }>(
-      'SELECT id,funding_target AS target,status FROM projects WHERE public_id=$1 FOR UPDATE',
+    const existing = await client.query<{ id: string; amount: string; projectId: string; contributorId: string }>(
+      'SELECT public_id AS id,amount,project_id AS "projectId",contributor_id AS "contributorId" FROM contributions WHERE idempotency_key=$1',
+      [input.idempotencyKey],
+    )
+    if (existing.rows[0]) {
+      if (existing.rows[0].contributorId !== request.user!.id) throw new HttpError(409, 'This pledge request key has already been used.', 'IDEMPOTENCY_KEY_REUSED')
+      return { id: existing.rows[0].id, amount: existing.rows[0].amount, projectId: existing.rows[0].projectId, duplicate: true }
+    }
+    const project = await client.query<{ id: string; ownerId: string; target: string; status: string }>(
+      'SELECT id,owner_id AS "ownerId",funding_target AS target,status FROM projects WHERE public_id=$1 FOR UPDATE',
       [request.params.id],
     )
     const row = project.rows[0]
     if (!row) throw new HttpError(404, 'Project not found.', 'PROJECT_NOT_FOUND')
-    if (row.status !== 'funding') throw new HttpError(409, 'This project is not accepting contributions.', 'PROJECT_NOT_FUNDING')
+    if (row.status !== 'funding') throw new HttpError(409, 'This project is not accepting pledges.', 'PROJECT_NOT_FUNDING')
     const raisedResult = await client.query<{ raised: string }>(
-      "SELECT coalesce(sum(amount),0) AS raised FROM contributions WHERE project_id=$1 AND status IN ('simulated','confirmed')",
+      "SELECT coalesce(sum(amount),0) AS raised FROM contributions WHERE project_id=$1 AND status IN ('simulated','confirmed','pledged')",
       [row.id],
     )
     const remaining = Number(row.target) - Number(raisedResult.rows[0].raised)
     if (input.amount > remaining) throw new HttpError(409, `Contribution exceeds the remaining target of ${remaining}.`, 'CONTRIBUTION_EXCEEDS_TARGET')
     const publicId = `CON-${randomUUID().slice(0, 8).toUpperCase()}`
     const inserted = await client.query(
-      `INSERT INTO contributions(public_id,project_id,contributor_id,amount,idempotency_key)
-       VALUES($1,$2,$3,$4,$5) RETURNING public_id AS id,amount,status`,
+      `INSERT INTO contributions(public_id,project_id,contributor_id,amount,idempotency_key,status)
+       VALUES($1,$2,$3,$4,$5,'pledged') RETURNING public_id AS id,amount,status`,
       [publicId, row.id, request.user!.id, input.amount, input.idempotencyKey],
     )
-    await writeAudit(client, request.user!.id, 'project.contribution_simulated', 'project', routeId(request), { amount: input.amount, contributionId: publicId })
+    if (row.ownerId !== request.user!.id) {
+      await writeNotification(client, row.ownerId, `project:${publicId}:pledge`, 'New non-cash pledge', `${publicId} · ${input.amount.toFixed(2)} USD recorded without payment.`, 'Solar projects')
+    }
+    await writeAudit(client, request.user!.id, 'project.pledge_recorded', 'project', routeId(request), { amount: input.amount, contributionId: publicId, noPayment: true })
     return { ...inserted.rows[0], duplicate: false }
   })
   response.status(result.duplicate ? 200 : 201).json({ data: { ...result, amount: Number(result.amount) } })
@@ -771,8 +847,10 @@ api.get('/api/audit', asyncRoute(async (request, response) => {
   const result = await query(
     `SELECT e.event_type AS "eventType",e.entity_type AS "entityType",e.entity_id AS "entityId",
       e.source,e.metadata,e.created_at AS "createdAt",u.display_name AS actor
-     FROM audit_events e LEFT JOIN users u ON u.id=e.actor_id ORDER BY e.created_at DESC LIMIT $1 OFFSET $2`,
-    [limit, (page - 1) * limit],
+     FROM audit_events e LEFT JOIN users u ON u.id=e.actor_id
+     WHERE e.actor_id=$3 OR $4
+     ORDER BY e.created_at DESC LIMIT $1 OFFSET $2`,
+    [limit, (page - 1) * limit, request.user!.id, ['verifier', 'admin'].includes(request.user!.role)],
   )
   response.json({ data: result.rows, page, limit })
 }))
@@ -780,9 +858,10 @@ api.get('/api/audit', asyncRoute(async (request, response) => {
 api.get('/api/matches', asyncRoute(async (request, response) => {
   const listingId = z.string().min(5).max(80).parse(request.query.listingId)
   const result = await query(
-    `SELECT id,public_id AS "publicId",type,owner_id AS "ownerId",available_kwh AS available,
-      price_per_kwh AS price,service_area AS area,delivery_start AS "deliveryStart",delivery_end AS "deliveryEnd"
-     FROM listings WHERE public_id=$1 AND status='open'`,
+    `SELECT l.id,l.public_id AS "publicId",l.type,l.owner_id AS "ownerId",l.available_kwh AS available,
+      l.price_per_kwh AS price,l.service_area AS area,l.delivery_start AS "deliveryStart",l.delivery_end AS "deliveryEnd"
+     FROM listings l JOIN users owner ON owner.id=l.owner_id
+     WHERE l.public_id=$1 AND l.status='open' AND owner.wallet_address IS NOT NULL AND owner.demo_key IS NULL`,
     [listingId],
   )
   const selected = result.rows[0]
@@ -792,7 +871,8 @@ api.get('/api/matches', asyncRoute(async (request, response) => {
       l.price_per_kwh AS price,l.service_area AS area,l.delivery_start AS "deliveryStart",l.delivery_end AS "deliveryEnd",
       u.display_name AS owner
      FROM listings l JOIN users u ON u.id=l.owner_id
-     WHERE l.status='open' AND l.type<>$1 AND l.id<>$2 AND l.owner_id<>$3
+     WHERE l.status='open' AND u.wallet_address IS NOT NULL AND u.demo_key IS NULL
+       AND l.type<>$1 AND l.id<>$2 AND l.owner_id<>$3
        AND lower(l.service_area)=lower($4)
        AND (($1='offer' AND l.price_per_kwh >= $5) OR ($1='request' AND l.price_per_kwh <= $5))
        AND l.delivery_start < $6 AND $7 < l.delivery_end
@@ -822,6 +902,21 @@ async function writeAudit(client: import('pg').PoolClient, actorId: string, even
   await client.query(
     'INSERT INTO audit_events(actor_id,event_type,entity_type,entity_id,metadata) VALUES($1,$2,$3,$4,$5)',
     [actorId, eventType, entityType, entityId, JSON.stringify(metadata)],
+  )
+}
+
+async function writeNotification(
+  client: import('pg').PoolClient,
+  userId: string,
+  eventKey: string,
+  title: string,
+  detail: string,
+  page: 'Trades' | 'Evidence' | 'Solar projects' | 'Activity',
+) {
+  await client.query(
+    `INSERT INTO notifications(user_id,event_key,title,detail,page)
+     VALUES($1,$2,$3,$4,$5) ON CONFLICT(user_id,event_key) DO NOTHING`,
+    [userId, eventKey, title, detail, page],
   )
 }
 

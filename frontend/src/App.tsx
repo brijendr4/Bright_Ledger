@@ -31,7 +31,7 @@ import {
   X,
   Zap,
 } from 'lucide-react'
-import { apiGet, apiGetBlob, apiPatch, apiPost, apiUpload, ApiError, clearAccessToken, getCurrentUser, removeWalletAccountWithSignature, revokeCurrentSession, signInWallet } from './lib/api'
+import { apiGet, apiGetBlob, apiPatch, apiPost, apiUpload, ApiError, clearAccessToken, clearLegacyAccessToken, getCurrentUser, hasAccessToken, removeWalletAccountWithSignature, revokeWalletSession, signInWallet } from './lib/api'
 import { commitTradeOnChain, makeEvidenceHash, reviewEvidenceOnChain, settleTradeOnChain, submitEvidenceOnChain } from './lib/chain'
 import './App.css'
 
@@ -64,7 +64,7 @@ type Trade = {
 type EvidenceAiAnalysis = { summary: string; confidence: 'low' | 'medium' | 'high'; flags: string[]; suggestedChecks: string[] }
 type EvidenceAiReview = { id: string; fileSha256: string; model: string; analysis: EvidenceAiAnalysis }
 type Evidence = { id: string; project: string; source: string; quantity: number; interval: string; status: 'Pending' | 'Approved' | 'Rejected'; trade: string; reason?: string; reference?: string; evidenceFileSha256?: string; evidenceFileAvailable?: boolean; aiReview?: EvidenceAiReview | null }
-type Project = { id: string; name: string; location: string; area: number; target: number; raised: number; capacity: number; owner: string; status: string; image: string; siteType: string; permission: string; notes: string; fundingAiModel: string; fundingAiSummary: string; fundingAiConfidence: 'low' | 'medium' | 'high' }
+type Project = { id: string; name: string; location: string; area: number; target: number; raised: number; capacity: number; owner: string; ownerId?: string; status: string; image: string; siteType: string; permission: string; notes: string; estimateModel: string; fundingMethodology: string; estimateReviewSummary: string; estimateReviewConfidence: string; estimateLimitation: string }
 type Contribution = { id: string; projectId: string; contributor: string; amount: number; time: string; status: string }
 type SolarWorkspaceData = {
   project: { id: string; siteId: string; name: string; owner: string; status: string; capacityKwp: number; fundingTargetMinor: number; fundingDeadline: string; agreementHash: string | null; allocationRules: { funderPct: number; ownerPct: number; operatorPct: number; reserveMinor: number; feeMinor: number; version: string } }
@@ -103,8 +103,8 @@ type ProjectFundingEstimate = {
   }
 }
 type SettlementPreview = { projectId: string; periodStart: string; periodEnd: string; grossProceedsMinor: number; operatingReserveMinor: number; platformFeeMinor: number; distributablePoolMinor: number; rulesVersion: string; allocations: { recipient: string; type: string; amountMinor: number }[]; inputHash: string; outputHash: string }
-type AppState = { listings: Listing[]; trades: Trade[]; evidence: Evidence[]; projects: Project[]; contributions: Contribution[]; points: number; activity: { title: string; detail: string; time: string }[] }
-type AppNotification = { id: string; title: string; detail: string; page: 'Trades' | 'Evidence' }
+type AppState = { listings: Listing[]; trades: Trade[]; evidence: Evidence[]; projects: Project[]; contributions: Contribution[]; points: number; activity: { title: string; detail: string; time: string }[]; notifications: AppNotification[] }
+type AppNotification = { id: string; title: string; detail: string; page: Page; readAt: string | null; createdAt: string }
 type ApiSnapshot = {
   listings: (Omit<Listing, 'status'> & { status: string })[]
   trades: (Omit<Trade, 'status'> & { status: string })[]
@@ -113,9 +113,10 @@ type ApiSnapshot = {
   contributions: Contribution[]
   points: number
   activity: AppState['activity']
+  notifications: AppNotification[]
 }
 
-const emptyState: AppState = { listings: [], trades: [], evidence: [], projects: [], contributions: [], points: 0, activity: [] }
+const emptyState: AppState = { listings: [], trades: [], evidence: [], projects: [], contributions: [], points: 0, activity: [], notifications: [] }
 
 const tourSteps: { page: Page; target: string; title: string; description: string }[] = [
   { page: 'Overview', target: 'overview', title: 'Your energy overview', description: 'Start here to see listed energy, trade records, recent activity, and evidence status. These are marketplace records—not proof that electricity was physically delivered.' },
@@ -142,32 +143,6 @@ const navigation: { label: Page; icon: typeof Activity; group: string }[] = [
 
 const formatUSD = (value: number) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(value)
 const tourKeyForAccount = (accountId: string) => `bright-ledger-tour-complete:${accountId}`
-const notificationKeyForAccount = (accountId: string) => `bright-ledger-read-notifications:${accountId}`
-function buildNotifications(state: AppState): AppNotification[] {
-  const tradeNotifications = state.trades.flatMap((trade): AppNotification[] => {
-    const details = {
-      'Awaiting confirmation': ['Trade needs your confirmation', `${trade.id} · ${trade.quantity} kWh`],
-      'Evidence needed': ['Delivery evidence requested', `${trade.id} · ${trade.quantity} kWh`],
-      'Ready to settle': ['Trade is ready to settle', `${trade.id} · ${trade.quantity} kWh`],
-      Disputed: ['Trade requires review', `${trade.id} · ${trade.quantity} kWh`],
-    }[trade.status]
-    return details ? [{ id: `trade:${trade.id}:${trade.status}`, title: details[0], detail: details[1], page: 'Trades' }] : []
-  })
-  const evidenceNotifications = state.evidence.flatMap((item): AppNotification[] => {
-    const title = item.status === 'Pending'
-      ? 'Evidence is awaiting review'
-      : item.status === 'Approved'
-        ? 'Evidence review approved'
-        : 'Evidence review rejected'
-    return [{
-      id: `evidence:${item.id}:${item.status}`,
-      title,
-      detail: `${item.trade} · ${item.quantity} kWh`,
-      page: 'Evidence',
-    }]
-  })
-  return [...tradeNotifications, ...evidenceNotifications].slice(0, 20)
-}
 const explorerAddressUrl = (chainId: number | null, address: string) => {
   const explorers: Record<number, string> = {
     1: 'https://etherscan.io',
@@ -232,6 +207,7 @@ function mapSnapshot(data: ApiSnapshot): AppState {
     contributions: data.contributions.map((item) => ({ ...item, status: titleCase(item.status) })),
     points: data.points,
     activity: data.activity,
+    notifications: data.notifications,
   }
 }
 
@@ -241,9 +217,10 @@ async function sha256File(file: File): Promise<string> {
 }
 
 function App() {
+  const mockApiEnabled = false
   const [state, setState] = useState<AppState>(emptyState)
   const [page, setPage] = useState<Page>('Overview')
-  const [walletSessionActive, setWalletSessionActive] = useState(false)
+  const [authenticatedWorkspace, setAuthenticatedWorkspace] = useState(false)
   const [role, setRole] = useState<Role>('Prosumer')
   const [authMode, setAuthMode] = useState<'none' | 'wallet'>('none')
   const [apiConnected, setApiConnected] = useState(false)
@@ -258,7 +235,7 @@ function App() {
   const [configuredChainId, setConfiguredChainId] = useState<number | null>(null)
   const [contractAddress, setContractAddress] = useState<string | null>(null)
   const [walletDisplayName, setWalletDisplayName] = useState('')
-  const [walletRole, setWalletRole] = useState<'prosumer' | 'consumer' | 'both'>('consumer')
+  const [walletRole, setWalletRole] = useState<'prosumer' | 'consumer' | 'both' | 'funder'>('consumer')
   const [showDisclosure, setShowDisclosure] = useState(() => {
     try { return localStorage.getItem('bright-ledger-prototype-disclosure-v1') !== 'true' } catch { return true }
   })
@@ -284,13 +261,20 @@ function App() {
   const [notificationsOpen, setNotificationsOpen] = useState(false)
   const [accountMenuOpen, setAccountMenuOpen] = useState(false)
   const [accountRemovalOpen, setAccountRemovalOpen] = useState(false)
-  const [readNotificationIds, setReadNotificationIds] = useState<string[]>([])
   const [statusFilter, setStatusFilter] = useState('All status')
   const [projectFilter, setProjectFilter] = useState('All projects')
   const [tourStep, setTourStep] = useState(-1)
   const [tourTargetRect, setTourTargetRect] = useState<{ top: number; left: number; width: number; height: number } | null>(null)
   const [aiEvidenceReview, setAiEvidenceReview] = useState<EvidenceAiReview | null>(null)
   const [aiEvidenceLoading, setAiEvidenceLoading] = useState(false)
+
+  useEffect(() => {
+    try {
+      clearLegacyAccessToken()
+    } catch {
+      setApiError('The legacy browser token could not be cleared. Sign out and clear site data if this device is shared.')
+    }
+  }, [])
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme
@@ -302,39 +286,32 @@ function App() {
   }, [theme])
 
   useEffect(() => {
-    if (!walletSessionActive) return
+    if (!authenticatedWorkspace) return
     let cancelled = false
     const initialize = async () => {
       const user = await getCurrentUser()
-      if (!user.walletAddress) {
-        clearAccessToken()
-        if (!cancelled) {
-          setWalletSessionActive(false)
-          setAuthMode('none')
-          setApiError('A wallet-backed account is required. Connect your EVM wallet to continue.')
-        }
-        return
-      }
-      const accounts = window.ethereum ? await window.ethereum.request({ method: 'eth_accounts' }) : []
+      const accounts = window.ethereum
+        ? await window.ethereum.request({ method: 'eth_accounts' })
+        : []
       const activeAddress = Array.isArray(accounts) && typeof accounts[0] === 'string' ? accounts[0] : ''
-      if (activeAddress.toLowerCase() !== user.walletAddress.toLowerCase()) {
+      if (!user.walletAddress || activeAddress.toLowerCase() !== user.walletAddress.toLowerCase()) {
         clearAccessToken()
         if (!cancelled) {
-          setWalletSessionActive(false)
+          setAuthenticatedWorkspace(false)
           setAuthMode('none')
           setWalletAddress(activeAddress)
-          setApiError('Your active wallet does not match this session. Reconnect the account to continue.')
+          setApiError('The active wallet does not match this session. Connect and authorize the account again.')
         }
         return
       }
+      const userRole: Record<string, Role> = { prosumer: 'Prosumer', consumer: 'Consumer', both: 'Both', verifier: 'Verifier', admin: 'Admin', funder: 'Funder', space_owner: 'Space owner' }
       if (!cancelled) {
-        setWalletAddress(user.walletAddress)
         setIdentity(user.displayName)
         setAccountId(user.id)
-        const userRole: Record<string, Role> = { prosumer: 'Prosumer', consumer: 'Consumer', both: 'Both', verifier: 'Verifier', funder: 'Funder', space_owner: 'Space owner', admin: 'Admin' }
+        setWalletAddress(user.walletAddress)
+        setAuthMode('wallet')
         setRole(userRole[user.role] ?? 'Consumer')
       }
-      const tourAccountId = user.id
       const [snapshot, config] = await Promise.all([
         apiGet<ApiSnapshot>('/api/bootstrap'),
         apiGet<{ chain: { enabled: boolean; chainId: number; contractAddress: string | null } }>('/api/config'),
@@ -347,7 +324,7 @@ function App() {
         setApiConnected(true)
         let tourCompleted = false
         try {
-          tourCompleted = localStorage.getItem(tourKeyForAccount(tourAccountId)) === 'true'
+          tourCompleted = localStorage.getItem(tourKeyForAccount(user.id)) === 'true'
         } catch {
           notify('Browser storage is unavailable. The guided tour may appear again next visit.')
         }
@@ -361,8 +338,12 @@ function App() {
       if (!cancelled) {
         if (error instanceof ApiError && error.status === 401) {
           clearAccessToken()
-          setWalletSessionActive(false)
+          setAuthenticatedWorkspace(false)
           setAuthMode('none')
+          setState(emptyState)
+          setAccountId('')
+          setIdentity('')
+          setWalletAddress('')
         }
         setApiConnected(false)
         setApiError(error instanceof ApiError ? error.message : 'Could not load Bright Ledger data.')
@@ -371,7 +352,72 @@ function App() {
       if (!cancelled) setApiBusy(false)
     })
     return () => { cancelled = true }
-  }, [walletSessionActive, authMode])
+  }, [authenticatedWorkspace])
+
+  useEffect(() => {
+    if (!hasAccessToken()) return
+    let cancelled = false
+    setApiBusy(true)
+    void getCurrentUser().then(async (user) => {
+      const accounts = window.ethereum
+        ? await window.ethereum.request({ method: 'eth_accounts' })
+        : []
+      const activeAddress = Array.isArray(accounts) && typeof accounts[0] === 'string' ? accounts[0] : ''
+      if (!user.walletAddress || activeAddress.toLowerCase() !== user.walletAddress.toLowerCase()) {
+        throw new ApiError('Reconnect the wallet used to authorize this session.', 401, 'WALLET_SESSION_MISMATCH')
+      }
+      if (cancelled) return
+      setWalletAddress(user.walletAddress)
+      setWalletDisplayName(user.displayName)
+      setIdentity(user.displayName)
+      setAccountId(user.id)
+      const userRole: Record<string, Role> = { prosumer: 'Prosumer', consumer: 'Consumer', both: 'Both', verifier: 'Verifier', admin: 'Admin', funder: 'Funder', space_owner: 'Space owner' }
+      setRole(userRole[user.role] ?? 'Consumer')
+      setAuthMode('wallet')
+      setAuthenticatedWorkspace(true)
+    }).catch((error: unknown) => {
+      if (cancelled) return
+      if (error instanceof ApiError && error.code === 'WALLET_SESSION_MISMATCH') {
+        void revokeWalletSession().catch(() => {
+          setApiError('The saved wallet did not match the active account, and the server session could not be revoked.')
+        })
+      }
+      clearAccessToken()
+      setApiError(error instanceof Error ? error.message : 'The saved wallet session could not be resumed.')
+    }).finally(() => {
+      if (!cancelled) setApiBusy(false)
+    })
+    return () => { cancelled = true }
+  }, [])
+
+  useEffect(() => {
+    const handleUnauthorized = () => {
+      clearAccessToken()
+      setState(emptyState)
+      setAccountId('')
+      setIdentity('')
+      setWalletAddress('')
+      setAuthMode('none')
+      setAuthenticatedWorkspace(false)
+      setApiConnected(false)
+      setApiError('Your wallet session expired or was revoked. Connect and authorize your wallet to continue.')
+      setPage('Overview')
+    }
+    window.addEventListener('bright-ledger:unauthorized', handleUnauthorized)
+    return () => window.removeEventListener('bright-ledger:unauthorized', handleUnauthorized)
+  }, [])
+
+  useEffect(() => {
+    if (!authenticatedWorkspace) return
+    const interval = window.setInterval(() => {
+      void refreshFromApi().catch((error: unknown) => {
+        if (error instanceof ApiError && error.status === 401) return
+        setApiConnected(false)
+        setApiError(error instanceof Error ? error.message : 'Could not refresh account activity.')
+      })
+    }, 30_000)
+    return () => window.clearInterval(interval)
+  }, [authenticatedWorkspace])
 
   useEffect(() => {
     const ethereum = window.ethereum
@@ -390,14 +436,18 @@ function App() {
       const nextAddress = Array.isArray(value) && typeof value[0] === 'string' ? value[0] : ''
       setWalletAddress(nextAddress)
       if (authMode === 'wallet' && nextAddress.toLowerCase() !== walletAddress.toLowerCase()) {
-        const revocation = revokeCurrentSession()
+        void revokeWalletSession().catch((error: unknown) => {
+          setToast(error instanceof Error ? `Wallet changed; session revocation could not be confirmed: ${error.message}` : 'Wallet changed; server session revocation could not be confirmed.')
+        })
         clearAccessToken()
-        void revocation.catch(() => notify('Wallet changed. The local session was cleared, but remote revocation could not be confirmed.'))
-        setWalletSessionActive(false)
+        setAuthenticatedWorkspace(false)
         setAuthMode('none')
         setAccountId('')
+        setIdentity('')
+        setState(emptyState)
         setApiConnected(false)
         setWalletDisplayName(identity)
+        setPage('Overview')
         setApiError(nextAddress
           ? 'The active wallet account changed. Sign in again with the new account.'
           : 'The wallet disconnected. Sign in again to continue.')
@@ -423,21 +473,6 @@ function App() {
   }, [authMode, identity, walletAddress])
 
   useEffect(() => {
-    if (!accountId) {
-      setReadNotificationIds([])
-      return
-    }
-    try {
-      const stored = localStorage.getItem(notificationKeyForAccount(accountId))
-      const parsed: unknown = stored ? JSON.parse(stored) : []
-      setReadNotificationIds(Array.isArray(parsed) && parsed.every((item) => typeof item === 'string') ? parsed : [])
-    } catch {
-      setReadNotificationIds([])
-      notify('Notification read state could not be loaded from this browser.')
-    }
-  }, [accountId])
-
-  useEffect(() => {
     if (!toast) return
     const timer = window.setTimeout(() => setToast(''), 3200)
     return () => window.clearTimeout(timer)
@@ -452,47 +487,47 @@ function App() {
   const totalOffered = state.listings.filter((listing) => listing.type === 'offer').reduce((sum, listing) => sum + listing.quantity, 0)
   const settledEnergy = state.trades.filter((trade) => trade.status === 'Settled').reduce((sum, trade) => sum + trade.quantity, 0)
   const pendingEvidence = state.evidence.filter((item) => item.status === 'Pending')
-  const notifications = buildNotifications(state)
-  const unreadNotifications = notifications.filter((item) => !readNotificationIds.includes(item.id))
+  const notifications = state.notifications
+  const unreadNotifications = notifications.filter((item) => !item.readAt)
 
   function notify(message: string) {
     setToast(message)
   }
 
-  function markNotificationRead(id: string) {
-    const next = [...new Set([...readNotificationIds, id])]
-    setReadNotificationIds(next)
+  async function markNotificationRead(id: string) {
     try {
-      localStorage.setItem(notificationKeyForAccount(accountId), JSON.stringify(next))
-    } catch {
-      notify('Notification read state could not be saved in this browser.')
+      const response = await apiPatch<{ data: { id: string; readAt: string } }>(`/api/notifications/${encodeURIComponent(id)}/read`, {})
+      setState((current) => ({ ...current, notifications: current.notifications.map((item) => item.id === id ? { ...item, readAt: response.data.readAt } : item) }))
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Notification could not be marked as read.')
     }
   }
 
-  function markAllNotificationsRead() {
-    const next = [...new Set([...readNotificationIds, ...notifications.map((item) => item.id)])]
-    setReadNotificationIds(next)
+  async function markAllNotificationsRead() {
     try {
-      localStorage.setItem(notificationKeyForAccount(accountId), JSON.stringify(next))
+      await apiPost('/api/notifications/read-all', {})
+      const readAt = new Date().toISOString()
+      setState((current) => ({ ...current, notifications: current.notifications.map((item) => ({ ...item, readAt: item.readAt ?? readAt })) }))
       notify('All notifications marked as read.')
-    } catch {
-      notify('Notification read state could not be saved in this browser.')
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Notification read state could not be saved.')
     }
   }
 
   function signOut() {
-    const revocation = revokeCurrentSession()
-    clearAccessToken()
-    void revocation.catch((error: unknown) => {
-      notify(error instanceof Error ? `Signed out locally, but the server session could not be revoked: ${error.message}` : 'Signed out locally, but the server session could not be revoked.')
+    void revokeWalletSession().catch((error: unknown) => {
+      notify(error instanceof Error ? `Signed out locally; server session revocation could not be confirmed: ${error.message}` : 'Signed out locally; server session revocation could not be confirmed.')
     })
+    clearAccessToken()
     setAccountMenuOpen(false)
     setNotificationsOpen(false)
     setAccountRemovalOpen(false)
     setAccountId('')
     setIdentity('')
+    setWalletAddress('')
+    setState(emptyState)
     setAuthMode('none')
-    setWalletSessionActive(false)
+    setAuthenticatedWorkspace(false)
     setApiConnected(false)
     setApiError('')
     setPage('Overview')
@@ -506,7 +541,6 @@ function App() {
       await removeWalletAccountWithSignature(walletAddress)
       clearAccessToken()
       try {
-        localStorage.removeItem(notificationKeyForAccount(accountId))
         localStorage.removeItem(tourKeyForAccount(accountId))
       } catch {
         notify('Account was removed, but local browser preferences could not be cleared.')
@@ -517,7 +551,7 @@ function App() {
       setWalletAddress('')
       setIdentity('')
       setAuthMode('none')
-      setWalletSessionActive(false)
+      setAuthenticatedWorkspace(false)
       setApiConnected(false)
       setApiError('')
       setLandingNotice('Wallet profile removed. Existing marketplace records remain anonymized for audit history.')
@@ -534,39 +568,7 @@ function App() {
     const snapshot = await apiGet<ApiSnapshot>('/api/bootstrap')
     setState(mapSnapshot(snapshot))
     setApiConnected(true)
-    setApiError('')
   }
-
-  useEffect(() => {
-    if (!walletSessionActive) return
-    let active = true
-    const pollSnapshot = async () => {
-      if (document.visibilityState !== 'visible') return
-      try {
-        const snapshot = await apiGet<ApiSnapshot>('/api/bootstrap')
-        if (active) {
-          setState(mapSnapshot(snapshot))
-          setApiConnected(true)
-        }
-      } catch (error) {
-        if (!active) return
-        if (error instanceof ApiError && error.status === 401) {
-          clearAccessToken()
-          setWalletSessionActive(false)
-          setAuthMode('none')
-        }
-        setApiConnected(false)
-        setApiError(error instanceof Error ? error.message : 'Could not refresh account updates.')
-      }
-    }
-    const interval = window.setInterval(() => { void pollSnapshot() }, 30_000)
-    document.addEventListener('visibilitychange', pollSnapshot)
-    return () => {
-      active = false
-      window.clearInterval(interval)
-      document.removeEventListener('visibilitychange', pollSnapshot)
-    }
-  }, [walletSessionActive])
 
   async function connectWallet() {
     const name = walletDisplayName.trim()
@@ -582,10 +584,10 @@ function App() {
       setIdentity(user.displayName)
       setAccountId(user.id)
       setWalletAddress(user.walletAddress ?? '')
-      const userRole: Record<string, Role> = { prosumer: 'Prosumer', consumer: 'Consumer', both: 'Both', verifier: 'Verifier', funder: 'Funder', space_owner: 'Space owner', admin: 'Admin' }
+      const userRole: Record<string, Role> = { prosumer: 'Prosumer', consumer: 'Consumer', both: 'Both', verifier: 'Verifier', admin: 'Admin', funder: 'Funder', space_owner: 'Space owner' }
       setRole(userRole[user.role] ?? 'Consumer')
       setAuthMode('wallet')
-      setWalletSessionActive(true)
+      setAuthenticatedWorkspace(true)
       acceptDisclosure()
       notify('Wallet account connected. Your private keys remain in your wallet.')
     } catch (error) {
@@ -682,9 +684,42 @@ function App() {
     }
   }, [tourStep, page])
 
-  function enterMarketplace() {
-    setLandingNotice('Connect and sign in with an EVM wallet before entering the private marketplace.')
-    document.querySelector('#account')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  async function enterWorkspace() {
+    acceptDisclosure()
+    if (!hasAccessToken()) {
+      setApiError('Connect and authorize your EVM wallet before entering the private marketplace.')
+      document.querySelector('#account')?.scrollIntoView({ behavior: 'smooth' })
+      return
+    }
+    setApiBusy(true)
+    setApiError('')
+    try {
+      const user = await getCurrentUser()
+      const accounts = window.ethereum ? await window.ethereum.request({ method: 'eth_accounts' }) : []
+      const activeAddress = Array.isArray(accounts) && typeof accounts[0] === 'string' ? accounts[0] : ''
+      if (!user.walletAddress || activeAddress.toLowerCase() !== user.walletAddress.toLowerCase()) {
+        throw new ApiError('Connect and authorize the wallet linked to this account.', 401, 'WALLET_SESSION_MISMATCH')
+      }
+      setIdentity(user.displayName)
+      setAccountId(user.id)
+      setWalletAddress(user.walletAddress)
+      const userRole: Record<string, Role> = { prosumer: 'Prosumer', consumer: 'Consumer', both: 'Both', verifier: 'Verifier', admin: 'Admin', funder: 'Funder', space_owner: 'Space owner' }
+      setRole(userRole[user.role] ?? 'Consumer')
+      setAuthMode('wallet')
+      setAuthenticatedWorkspace(true)
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'WALLET_SESSION_MISMATCH') {
+        void revokeWalletSession().catch(() => {
+          setApiError('The connected wallet did not match the saved account, and the server session could not be revoked.')
+        })
+      }
+      clearAccessToken()
+      const message = error instanceof Error ? error.message : 'Wallet authorization is required.'
+      setApiError(message)
+      notify(message)
+    } finally {
+      setApiBusy(false)
+    }
   }
 
   async function createListing(event: React.FormEvent<HTMLFormElement>) {
@@ -732,13 +767,8 @@ function App() {
       notify('Set whole-number owner, funder and community revenue shares that total exactly 100%.')
       return
     }
-    const fundingEstimateId = String(form.get('fundingEstimateId') ?? '')
-    if (!fundingEstimateId) {
-      notify('Calculate and save the AI-reviewed funding estimate before submitting this solar project.')
-      return
-    }
     try {
-      await apiPost<{ data: { id: string } }>('/api/projects', {
+      const created = await apiPost<{ data: { id: string; siteId: string } }>('/api/projects', {
         name: String(form.get('name') || 'New community solar site'),
         location: String(form.get('location') || ''),
         siteType: String(form.get('siteType') || 'Residential rooftop'),
@@ -746,8 +776,11 @@ function App() {
         permission: String(form.get('permission') || 'Permission pending review'),
         notes: String(form.get('notes') || ''),
         revenueShares,
-        fundingEstimateId,
+        ...(typeof form.get('fundingEstimateId') === 'string' && form.get('fundingEstimateId')
+          ? { fundingEstimateId: String(form.get('fundingEstimateId')) }
+          : {}),
       })
+      if (mockApiEnabled) await apiPost(`/api/solar/sites/${encodeURIComponent(created.data.siteId)}/estimate`, {})
       await refreshFromApi()
     } catch (error) {
       notify(error instanceof Error ? error.message : 'Could not submit the site.')
@@ -763,6 +796,24 @@ function App() {
       consentToAi: true,
     })
     return response.data
+  }
+
+  async function reviewSolarProject(project: Project, decision: 'approve' | 'reject') {
+    let reason: string | undefined
+    if (decision === 'reject') {
+      reason = window.prompt('Add a reason for rejecting this solar site:')?.trim()
+      if (!reason) {
+        notify('A rejection reason is required.')
+        return
+      }
+    }
+    try {
+      await apiPost(`/api/projects/${encodeURIComponent(project.id)}/review`, { decision, ...(reason ? { reason } : {}) })
+      await refreshFromApi()
+      notify(decision === 'approve' ? 'Solar site approved and pledges are now open.' : 'Solar site rejected; the owner was notified.')
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Could not review this solar site.')
+    }
   }
 
   async function createMatch(event: React.FormEvent<HTMLFormElement>) {
@@ -792,7 +843,7 @@ function App() {
     const amount = Number(new FormData(event.currentTarget).get('amount'))
     const remaining = selectedProject.target - selectedProject.raised
     if (!amount || amount <= 0 || amount > remaining) {
-      notify(`Enter an amount up to the remaining target (${formatUSD(remaining)}).`)
+      notify(`Enter a pledge up to the remaining target (${formatUSD(remaining)}).`)
       return
     }
     try {
@@ -804,17 +855,7 @@ function App() {
     }
     setModal(null)
     setSelectedProject(null)
-    notify('Contribution record saved.')
-  }
-
-  async function decideProject(project: Project, decision: 'approve' | 'reject') {
-    try {
-      await apiPost(`/api/projects/${encodeURIComponent(project.id)}/decision`, { decision })
-      await refreshFromApi()
-      notify(decision === 'approve' ? 'Solar project approved for test contributions.' : 'Solar project rejected.')
-    } catch (error) {
-      notify(error instanceof Error ? error.message : 'Could not update the solar project review.')
-    }
+    notify('Non-cash pledge recorded. No payment was made.')
   }
 
   async function reviewEvidence(evidence: Evidence, decision: 'Approved' | 'Rejected') {
@@ -999,7 +1040,7 @@ function App() {
 
   const pageTitle = page === 'Overview' ? `Good morning, ${identity.split(' ')[0] || 'neighbor'}` : page
   const pageDescription: Record<Page, string> = {
-    Overview: 'Here’s what’s happening across your local energy network.',
+    Overview: 'Here’s what’s happening across your energy network.',
     'Energy market': 'Find clean energy nearby and discover your next match.',
     'My offers': 'Manage the renewable energy you’ve made available.',
     'My requests': 'Track the energy you need from your community.',
@@ -1026,9 +1067,9 @@ function App() {
     return { left, top }
   })() : undefined
 
-  if (!walletSessionActive) return <>
+  if (!authenticatedWorkspace) return <>
     <Landing
-      onExplore={enterMarketplace}
+      onExplore={() => { void enterWorkspace() }}
       onWallet={() => { void connectWallet() }}
       displayName={walletDisplayName}
       setDisplayName={setWalletDisplayName}
@@ -1046,7 +1087,7 @@ function App() {
     <div className="app-shell">
       <aside className={`sidebar ${menuOpen ? 'sidebar-open' : ''}`}>
         <div className="sidebar-brand"><Logo /><button className="icon-button close-menu" aria-label="Close navigation" onClick={() => setMenuOpen(false)}><X size={19} /></button></div>
-        <div className="demo-chip"><span className="pulse-dot" /> WALLET SESSION <span className="workspace-state-dot" /></div>
+        <div className="demo-chip"><span className="pulse-dot" /> CONNECTED WORKSPACE <span className="workspace-state-dot" /></div>
         <div className="workspace-select"><span className="workspace-avatar">BL</span><span><b>My energy space</b><small>Global energy exchange</small></span><ChevronDown size={15} /></div>
         {['Workspace', 'Trading', 'Community solar', 'Manage'].map((group) => (
           <nav className="nav-group" key={group} aria-label={group}>
@@ -1083,7 +1124,7 @@ function App() {
                 {notifications.length === 0
                   ? <div className="notification-empty"><Bell size={18} /><span>No account updates yet.</span></div>
                   : <div className="notification-list">{notifications.map((item) => {
-                    const unread = !readNotificationIds.includes(item.id)
+                    const unread = !item.readAt
                     return <button className={`notification-item ${unread ? 'unread' : ''}`} key={item.id} onClick={() => {
                       markNotificationRead(item.id)
                       setPage(item.page)
@@ -1098,7 +1139,7 @@ function App() {
                 <Wallet size={16} /><span>{`${walletAddress.slice(0, 6)}…${walletAddress.slice(-4)}`}</span><ChevronDown size={14} />
               </button>
               {accountMenuOpen && <div className="account-popover">
-                <>
+                {authMode === 'wallet' ? <>
                   <div className="account-popover-heading"><span className="avatar">{identity.split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase() || 'W3'}</span><span><b>{identity}</b><small>{role} · wallet profile</small></span></div>
                   <div className="account-address"><span>Connected address</span><code title={walletAddress}>{walletAddress}</code><button className="text-link" onClick={() => { void copyText(walletAddress) }}><Copy size={13} /> Copy address</button></div>
                   <div className="account-network"><span>{walletChainId === null ? 'Network unavailable' : evmNetworkName(walletChainId)}</span><small>{walletChainId === null ? 'Check your wallet connection' : `Chain ID ${walletChainId}${configuredChainId === walletChainId ? ' · contract ready' : ' · contract unavailable'}`}</small></div>
@@ -1106,7 +1147,7 @@ function App() {
                   <button className="account-menu-link" onClick={() => { setPage('Settings'); setAccountMenuOpen(false) }}><Settings size={14} /> Profile & wallet settings</button>
                   <button className="account-menu-link" onClick={signOut}><Wallet size={14} /> Sign out of Bright Ledger</button>
                   <button className="account-menu-link danger-link" onClick={() => { setAccountRemovalOpen(true); setAccountMenuOpen(false) }}><X size={14} /> Remove account profile</button>
-                </>
+                </> : null}
               </div>}
             </div>
           </div>
@@ -1117,9 +1158,9 @@ function App() {
           <div className="page-heading">
             <div><div className="eyebrow"><span className="eyebrow-line" /> YOUR ENERGY, YOUR COMMUNITY</div><h1>{pageTitle}<span className="greeting-sun">✳</span></h1><p>{pageDescription[page]}</p></div>
             <div className="heading-actions">
-              <div className="role-switch"><span>Account role</span><b>{role}</b></div>
+              <div className="role-switch"><span>Wallet role</span><b>{role}</b></div>
               {(page === 'Overview' || page === 'My offers' || page === 'My requests') && <button className="button button-primary" data-tour-target={page === 'My offers' ? 'offer-form' : page === 'My requests' ? 'request-form' : undefined} onClick={() => setModal('listing')}><Plus size={17} /> Create listing</button>}
-              {page === 'Solar projects' && <button className="button button-primary" onClick={() => setModal('project')}><Plus size={17} /> List a site</button>}
+              {page === 'Solar projects' && ['Space owner', 'Admin'].includes(role) && <button className="button button-primary" onClick={() => setModal('project')}><Plus size={17} /> List a site</button>}
               {page === 'Energy market' && <button className="button button-primary" onClick={() => setModal('listing')}><Plus size={17} /> Create listing</button>}
             </div>
           </div>
@@ -1131,7 +1172,9 @@ function App() {
           {page === 'Trades' && <Trades trades={filteredTrades} statusFilter={statusFilter} setStatusFilter={setStatusFilter} state={state} onSettle={settleTrade} onConfirm={confirmTrade} onCommit={commitTrade} chainEnabled={chainEnabled} onEvidence={(trade) => { setAiEvidenceReview(null); setSelectedTrade(trade); setSelectedEvidence(null); setModal('evidence') }} onCopy={copyText} />}
           {page === 'Evidence' && <EvidencePage evidence={state.evidence} role={role} onReview={(item) => { setAiEvidenceReview(null); setSelectedEvidence(item); setModal('evidence') }} onSelect={(item) => { setAiEvidenceReview(null); setSelectedEvidence(item); setModal('evidence') }} onDownload={(item) => { void downloadEvidenceFile(item) }} />}
           {page === 'Rewards' && <Rewards state={state} />}
-          {page === 'Solar projects' && <Projects projects={filteredProjects} contributions={state.contributions} filter={projectFilter} setFilter={setProjectFilter} onFund={(project) => { setSelectedProject(project); setModal('fund') }} onCreate={() => setModal('project')} onDecision={(project, decision) => { void decideProject(project, decision) }} onOpen={setSolarWorkspaceId} workspaceId={solarWorkspaceId} onCloseWorkspace={() => setSolarWorkspaceId('')} role={role} identity={identity} mockApiEnabled={false} onNotify={notify} onRefresh={refreshFromApi} />}
+          {page === 'Solar projects' && <Projects projects={filteredProjects} contributions={state.contributions} filter={projectFilter} setFilter={setProjectFilter} onFund={(project) => { setSelectedProject(project); setModal('fund') }} onCreate={() => { if (['Space owner', 'Admin'].includes(role)) setModal('project'); else notify('Energy-host access is granted by the platform operator.') }} onOpen={setSolarWorkspaceId} workspaceId={solarWorkspaceId} onCloseWorkspace={() => setSolarWorkspaceId('')} role={role} identity={identity} mockApiEnabled={mockApiEnabled} onNotify={notify} onRefresh={refreshFromApi} />}
+          {page === 'Solar projects' && ['Verifier', 'Admin'].includes(role) && <SolarProjectReviewQueue projects={state.projects.filter((project) => project.status === 'Review')} onReview={(project, decision) => { void reviewSolarProject(project, decision) }} />}
+          {page === 'Solar projects' && <SolarEstimateTransparency projects={filteredProjects} />}
           {page === 'Activity' && <ActivityPage activity={state.activity} onCopy={copyText} />}
           {page === 'Settings' && <SettingsPage role={role} walletConnected={authMode === 'wallet'} walletAddress={walletAddress} walletChainId={walletChainId} configuredChainId={configuredChainId} contractAddress={contractAddress} theme={theme} setTheme={setTheme} onCopy={(value) => { void copyText(value) }} onSignOut={signOut} onRequestRemove={() => setAccountRemovalOpen(true)} onStartTour={startTour} onReset={() => { void refreshFromApi().then(() => notify('Refreshed shared records from the server.')).catch((error: unknown) => notify(error instanceof Error ? error.message : 'Could not refresh server records.')) }} />}
         </div>
@@ -1232,8 +1275,8 @@ function Landing({ onExplore, onWallet, displayName, setDisplayName, walletRole,
   onWallet: () => void
   displayName: string
   setDisplayName: (value: string) => void
-  walletRole: 'prosumer' | 'consumer' | 'both'
-  setWalletRole: (value: 'prosumer' | 'consumer' | 'both') => void
+  walletRole: 'prosumer' | 'consumer' | 'both' | 'funder'
+  setWalletRole: (value: 'prosumer' | 'consumer' | 'both' | 'funder') => void
   theme: 'light' | 'dark'
   busy: boolean
   error: string
@@ -1312,14 +1355,14 @@ function Landing({ onExplore, onWallet, displayName, setDisplayName, walletRole,
       <p className="impact-boundary"><ShieldCheck size={15} /> Bright Ledger currently records marketplace activity; this software does not deliver electricity, clear trades with a utility, verify meter data independently, or calculate avoided emissions. Any climate impact must be measured outside the platform and reported with its method and limitations.</p>
       <button className="button button-secondary" onClick={onExplore}>Explore the marketplace <ArrowRight size={15} /></button>
     </section>
-    <section className="landing-account" id="account"><div><span className="section-kicker">JOIN YOUR LOCAL NETWORK</span><h2>Start with your wallet.<br /><em>Stay in control.</em></h2><p>Sign a one-time account challenge with an EVM wallet. Your private keys stay in your wallet, and you can participate as a consumer or prosumer.</p>{error && <div className="landing-error" role="alert">{error}</div>}{notice && <div className="landing-notice" role="status">{notice}</div>}</div><form className="wallet-signup" onSubmit={(event) => { event.preventDefault(); onWallet() }}><label>Display name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="Your name" minLength={2} maxLength={80} required /></label><label>Participation role<select value={walletRole} onChange={(event) => setWalletRole(event.target.value as 'prosumer' | 'consumer' | 'both')}><option value="consumer">Consumer · looking for clean energy</option><option value="prosumer">Prosumer · sharing generated energy</option><option value="both">Both · consume and share</option></select></label><button className="button button-primary" disabled={busy} type="submit"><Wallet size={16} /> {busy ? 'Connecting…' : 'Create account with wallet'} <ArrowRight size={15} /></button><small>Bright Ledger will only request a signature. It never asks for your seed phrase or private key.</small><small>Network follows your wallet selection; on-chain actions need a deployed contract on that network. XRP Ledger requires separate integration.</small></form></section>
+    <section className="landing-account" id="account"><div><span className="section-kicker">JOIN YOUR LOCAL NETWORK</span><h2>Start with your wallet.<br /><em>Stay in control.</em></h2><p>Sign a one-time account challenge with an EVM wallet. Your private keys stay in your wallet, and you can participate as a consumer, prosumer, or funder. Energy-host access is operator-approved.</p>{error && <div className="landing-error" role="alert">{error}</div>}{notice && <div className="landing-notice" role="status">{notice}</div>}</div><form className="wallet-signup" onSubmit={(event) => { event.preventDefault(); onWallet() }}><label>Display name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="Your name" minLength={2} maxLength={80} required /></label><label>Participation role<select value={walletRole} onChange={(event) => setWalletRole(event.target.value as 'prosumer' | 'consumer' | 'both' | 'funder')}><option value="consumer">Consumer · looking for clean energy</option><option value="prosumer">Prosumer · sharing generated energy</option><option value="both">Both · consume and share</option><option value="funder">Funder · follow community projects</option></select></label><button className="button button-primary" disabled={busy} type="submit"><Wallet size={16} /> {busy ? 'Connecting…' : 'Create account with wallet'} <ArrowRight size={15} /></button><small>Bright Ledger will only request a signature. It never asks for your seed phrase or private key.</small><small>Network follows your wallet selection; on-chain actions need a deployed contract on that network. XRP Ledger requires separate integration.</small></form></section>
     <footer className="landing-footer"><Logo compact /><span>Clean energy. Real value.</span><span>Energy delivery, payments, and environmental claims require independent verification.</span><button onClick={onExplore}>Enter marketplace <ArrowRight size={14} /></button></footer>
   </main>
 }
 
 function Disclosure({ onAccept }: { onAccept: () => void }) {
   const [confirmed, setConfirmed] = useState(false)
-  return <div className="disclosure-backdrop"><section className="disclosure-card" role="dialog" aria-modal="true" aria-labelledby="disclosure-title" aria-describedby="disclosure-copy"><span className="disclosure-icon"><ShieldCheck size={22} /></span><span className="section-kicker">PROTOTYPE · NOT FOR REAL TRANSACTIONS</span><h2 id="disclosure-title">Please use sample data only</h2><p id="disclosure-copy">Bright Ledger is an early prototype for evaluation, not a live energy or financial service. Seed listings and project records are examples; meter readings, AI reviews, contributions, settlements, and rewards are not independently verified, and no electricity or money moves through this app. Use fictional names and site details, do not upload genuine documents, and do not connect a wallet holding assets or send funds. Data submitted is stored by the configured API database; this prototype is not production-secured. This notice is not legal advice or a guarantee of compliance.</p><label className="disclosure-consent"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>I understand and will use fictional/sample data only.</span></label><button className="button button-primary" onClick={onAccept} disabled={!confirmed}>Continue to prototype <ArrowRight size={15} /></button></section></div>
+  return <div className="disclosure-backdrop"><section className="disclosure-card" role="dialog" aria-modal="true" aria-labelledby="disclosure-title" aria-describedby="disclosure-copy"><span className="disclosure-icon"><ShieldCheck size={22} /></span><span className="section-kicker">PROTOTYPE · NOT FOR REAL TRANSACTIONS</span><h2 id="disclosure-title">Please use sample data only</h2><p id="disclosure-copy">Bright Ledger is a prototype, not a live energy or financial service. It records listings, trade and evidence reports, and non-cash solar pledges; it does not deliver electricity, accept investments, transfer money, or pay returns. Solar estimates and AI reviews are advisory, not verified engineering or financial advice. Use fictional names and site details, do not upload genuine or sensitive documents, and never connect a wallet holding assets or send funds. Records are stored in PostgreSQL and may not meet production security or privacy requirements. Seek qualified review before real-world use.</p><label className="disclosure-consent"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>I understand and will use fictional/sample data only.</span></label><button className="button button-primary" onClick={onAccept} disabled={!confirmed}>Continue to prototype <ArrowRight size={15} /></button></section></div>
 }
 
 function Status({ status }: { status: string }) {
@@ -1358,8 +1401,8 @@ function Market({ listings, marketTab, setMarketTab, onMatch, query, setQuery, o
     </div>
     {filtersOpen && <div className="market-filter-panel"><label>Service area<select value={areaFilter} onChange={(event) => setAreaFilter(event.target.value)}><option>All areas</option>{Array.from(new Set(listings.map((item) => item.area))).sort().map((area) => <option key={area}>{area}</option>)}</select></label><label>Renewable source<select value={sourceFilter} onChange={(event) => setSourceFilter(event.target.value)}><option>All sources</option>{Array.from(new Set(listings.map((item) => item.source))).sort().map((source) => <option key={source}>{source}</option>)}</select></label><button className="text-link" onClick={() => { setAreaFilter('All areas'); setSourceFilter('All sources') }}>Clear filters</button></div>}
     <div className="listing-results-head"><div><b>{visibleListings.length} {marketTab === 'offers' ? 'offers' : 'requests'} nearby</b><span> · sorted by {sortBy === 'price' ? 'best price' : sortBy === 'quantity' ? 'energy quantity' : 'newest'}</span></div><label className="select-control">Sort by<select aria-label="Sort market listings" value={sortBy} onChange={(event) => setSortBy(event.target.value)}><option value="price">Best price</option><option value="quantity">Most energy</option><option value="newest">Newest</option></select><ChevronDown size={14} /></label></div>
-    {visibleListings.length === 0 ? <div className="empty-state"><Sun size={26} /><h3>No listings found</h3><p>Try another search or switch to the other side of the market.</p></div> : <div className="market-list">{visibleListings.map((item) => <article className="market-listing" key={item.id}><div className="listing-person"><div className={`listing-avatar ${item.type === 'request' ? 'request-avatar' : ''}`}>{item.owner.split(' ').map((part) => part[0]).join('').slice(0, 2)}</div><div><b>{item.owner}</b><small>{item.area} <span>·</span> {item.id}</small></div></div><div className="listing-detail"><span>Energy</span><b>{item.quantity} kWh</b><small>{item.source}</small></div><div className="listing-detail"><span>{marketTab === 'offers' ? 'Price' : 'Max price'}</span><b>${item.price.toFixed(2)}<small> / kWh</small></b><small>{marketTab === 'offers' ? 'Seller-set asking price' : 'Buyer-entered limit'}</small></div><div className="listing-detail delivery"><span>Delivery window</span><b>{item.window.split(',')[0]}</b><small>{item.window.includes(',') ? item.window.split(',').slice(1).join(',') : item.window}</small></div><div className="listing-action"><Status status="Open" /><button className="button button-small" onClick={() => onMatch(item)}>{marketTab === 'offers' ? 'Request match' : 'Propose match'} <ArrowRight size={14} /></button></div></article>)}</div>}
-    <div className="market-disclosure"><ShieldCheck size={15} /><span>Prices are entered by participants, not live market quotes. No payments or grid delivery occur here.</span><button onClick={onInfo}>How matching works <ArrowRight size={13} /></button></div>
+    {visibleListings.length === 0 ? <div className="empty-state"><Sun size={26} /><h3>No listings found</h3><p>Try another search or switch to the other side of the market.</p></div> : <div className="market-list">{visibleListings.map((item) => <article className="market-listing" key={item.id}><div className="listing-person"><div className={`listing-avatar ${item.type === 'request' ? 'request-avatar' : ''}`}>{item.owner.split(' ').map((part) => part[0]).join('').slice(0, 2)}</div><div><b>{item.owner}</b><small>{item.area} <span>·</span> {item.id}</small></div></div><div className="listing-detail"><span>Energy</span><b>{item.quantity} kWh</b><small>{item.source}</small></div><div className="listing-detail"><span>{marketTab === 'offers' ? 'Price' : 'Max price'}</span><b>${item.price.toFixed(2)}<small> / kWh</small></b><small>{marketTab === 'offers' ? 'Fixed rate' : 'Buyer’s limit'}</small></div><div className="listing-detail delivery"><span>Delivery window</span><b>{item.window.split(',')[0]}</b><small>{item.window.includes(',') ? item.window.split(',').slice(1).join(',') : item.window}</small></div><div className="listing-action"><Status status="Open" /><button className="button button-small" onClick={() => onMatch(item)}>{marketTab === 'offers' ? 'Request match' : 'Propose match'} <ArrowRight size={14} /></button></div></article>)}</div>}
+    <div className="market-disclosure"><ShieldCheck size={15} /><span>Shared market · prices and energy volumes are simulated. No real payments or grid delivery.</span><button onClick={onInfo}>How matching works <ArrowRight size={13} /></button></div>
   </div>
 }
 
@@ -1545,26 +1588,25 @@ function SolarProjectWorkspace({ projectId, role, identity, onClose, onNotify, o
   </section>
 }
 
-function Projects({ projects, contributions, filter, setFilter, onFund, onCreate, onDecision, onOpen, workspaceId, onCloseWorkspace, role, identity, mockApiEnabled, onNotify, onRefresh }: { projects: Project[]; contributions: Contribution[]; filter: string; setFilter: (value: string) => void; onFund: (project: Project) => void; onCreate: () => void; onDecision: (project: Project, decision: 'approve' | 'reject') => void; onOpen: (projectId: string) => void; workspaceId: string; onCloseWorkspace: () => void; role: Role; identity: string; mockApiEnabled: boolean; onNotify: (message: string) => void; onRefresh: () => Promise<void> }) {
-  return <div className="page-stack">
-    <section className="solar-intro"><div><span className="section-kicker">COMMUNITY SOLAR · TEST FUNDING RECORDS</span><h2>Great roofs can<br />build brighter futures.</h2><p>Explore projects with user-entered costs, a saved AI advisory, and human review still required before funding.</p><button className="button button-primary" data-tour-target="projects" onClick={onCreate}><Plus size={16} /> Submit a solar site</button></div><div className="solar-intro-art"><img src="/images/solarfield.jpg" alt="A field of solar panels under clear skies" /></div></section>
-    <div className="solar-toolbar"><div><b>Solar projects</b><span> · {projects.length} opportunities</span></div><div className="filter-select-wrap"><Filter size={14} /><select aria-label="Filter solar projects" value={filter} onChange={(event) => setFilter(event.target.value)}><option>All projects</option><option>Funding</option><option>Operational</option><option>Review</option></select><ChevronDown size={13} /></div></div>
-    {projects.length === 0 ? <div className="empty-state"><Sun size={26} /><h3>No AI-reviewed projects yet</h3><p>Submit a site with cost assumptions, save its AI review, and send it for human review.</p></div> : <div className="project-grid">{projects.map((project, index) => <article className="project-card" key={project.id}>
-      <div className={`project-cover ${project.image}`}><img src={`/images/${['rooftop.jpg', 'rooftop_3.jpg', 'solarfield.jpg'][index % 3]}`} alt={`${project.name} solar project site`} /><span className="project-id">{project.id}</span><span className="project-cover-tag">COMMUNITY SOLAR</span></div>
-      <div className="project-card-body"><div className="project-location"><span><Sun size={13} /> {project.location}</span><Status status={project.status} /></div><h3>{project.name}</h3><p title={project.notes}>Site listed by {project.owner} · {project.siteType}</p><span className="project-permission"><ShieldCheck size={12} /> {project.permission}</span>
-        <div className="project-ai-review"><b>AI funding review · {project.fundingAiConfidence} confidence</b><p>{project.fundingAiSummary}</p><small>{project.fundingAiModel} · advisory only</small></div>
-        <div className="project-metrics"><div><span>Est. capacity</span><b>{project.capacity} <small>kW</small></b></div><div><span>Available area</span><b>{project.area} <small>m²</small></b></div><div><span>Funding target</span><b>{formatUSD(project.target)}</b></div></div>
-        <div className="funding-progress-head"><span>Reported test contributions · {contributions.filter((item) => item.projectId === project.id).length} records</span><b>{pct(project.raised, project.target)}%</b></div><div className="progress-track"><i style={{ width: `${pct(project.raised, project.target)}%` }} /></div><div className="funding-amount"><span>{formatUSD(project.raised)} <small>recorded</small></span><span>{formatUSD(project.target - project.raised)} <small>to go</small></span></div>
-        {project.status === 'Review' && (role === 'Verifier' || role === 'Admin') && <div className="project-review-actions"><button className="button button-approve" onClick={() => onDecision(project, 'approve')}>Approve for contributions</button><button className="button button-danger-outline" onClick={() => onDecision(project, 'reject')}>Reject project</button></div>}
-        <button className="button button-secondary project-action" disabled={project.status !== 'Funding'} onClick={() => onFund(project)}>{project.status === 'Review' || project.status === 'Draft' ? 'Awaiting site approval / publication' : project.raised >= project.target ? 'Funding target reached' : project.status === 'Funding' ? 'Record test contribution' : 'Funding unavailable'} <ArrowRight size={15} /></button>{mockApiEnabled && <button className="button button-outline project-action" onClick={() => onOpen(project.id)}>Open project workspace <ArrowRight size={15} /></button>}
-      </div></article>)}</div>}
-    {mockApiEnabled && workspaceId && <SolarProjectWorkspace key={workspaceId} projectId={workspaceId} role={role} identity={identity} onClose={onCloseWorkspace} onNotify={onNotify} onRefresh={onRefresh} />}
-    <div className="solar-disclaimer"><ShieldCheck size={15} /><span>Capacity uses an illustrative area assumption. Contributions are database records only, not investment, payments, or real funding; solar estimates are not engineering guarantees.</span></div>
-  </div>
+function SolarProjectReviewQueue({ projects, onReview }: {
+  projects: Project[]
+  onReview: (project: Project, decision: 'approve' | 'reject') => void
+}) {
+  if (!projects.length) return null
+  return <section className="panel list-page-panel"><div className="panel-heading"><div><span className="section-kicker">OPERATOR REVIEW</span><h2>Solar sites awaiting review</h2><p>Approval opens non-cash community pledges; it does not verify project costs or guarantee returns.</p></div></div><div className="solar-record-list">{projects.map((project) => <div key={project.id}><span><b>{project.name}</b><small>{project.id} · {project.location} · {project.permission}</small></span><button className="button button-danger-outline" onClick={() => onReview(project, 'reject')}>Reject</button><button className="button button-approve" onClick={() => onReview(project, 'approve')}>Approve</button></div>)}</div></section>
+}
+
+function SolarEstimateTransparency({ projects }: { projects: Project[] }) {
+  if (!projects.length) return null
+  return <section className="panel list-page-panel"><div className="panel-heading"><div><span className="section-kicker">ESTIMATE PROVENANCE</span><h2>Funding assumptions & AI review</h2><p>Every listed site is linked to an input-grounded estimate and a completed advisory review.</p></div></div><div className="solar-record-list">{projects.map((project) => <div key={project.id}><span><b>{project.name} · {project.estimateReviewConfidence} confidence</b><small>{project.fundingMethodology} · reviewed by {project.estimateModel}</small><small>{project.estimateReviewSummary}</small><small>{project.estimateLimitation}</small></span></div>)}</div></section>
+}
+
+function Projects({ projects, contributions, filter, setFilter, onFund, onCreate, onOpen, workspaceId, onCloseWorkspace, role, identity, mockApiEnabled, onNotify, onRefresh }: { projects: Project[]; contributions: Contribution[]; filter: string; setFilter: (value: string) => void; onFund: (project: Project) => void; onCreate: () => void; onOpen: (projectId: string) => void; workspaceId: string; onCloseWorkspace: () => void; role: Role; identity: string; mockApiEnabled: boolean; onNotify: (message: string) => void; onRefresh: () => Promise<void> }) {
+  return <div className="page-stack"><section className="solar-intro"><div><span className="section-kicker">COMMUNITY SOLAR · SIMULATED FUNDING</span><h2>Great roofs can<br />build brighter futures.</h2><p>Connect solar-ready spaces with community funders. Every number here is illustrative—no investment or payment takes place.</p><button className="button button-primary" data-tour-target="projects" onClick={onCreate}><Plus size={16} /> List a solar-ready site</button></div><div className="solar-intro-art"><img src="/images/solarfield.jpg" alt="A field of solar panels under clear skies" /></div></section>  <div className="solar-toolbar"><div><b>Solar projects</b><span> · {projects.length} opportunities</span></div><div className="filter-select-wrap"><Filter size={14} /><select aria-label="Filter solar projects" value={filter} onChange={(event) => setFilter(event.target.value)}><option>All projects</option><option>Funding</option><option>Operational</option><option>Review</option></select><ChevronDown size={13} /></div></div>{projects.length === 0 ? <div className="empty-state"><Sun size={26} /><h3>No projects found</h3><p>Projects appear after an input-grounded funding estimate is completed and a site is submitted.</p></div> : <div className="project-grid">{projects.map((project, index) => <article className="project-card" key={project.id}><div className={`project-cover ${project.image}`}><img src={`/images/${['rooftop.jpg', 'rooftop_3.jpg', 'solarfield.jpg'][index % 3]}`} alt={`${project.name} solar project site`} /><span className="project-id">{project.id}</span><span className="project-cover-tag">COMMUNITY SOLAR</span></div><div className="project-card-body"><div className="project-location"><span><Sun size={13} /> {project.location}</span><Status status={project.status} /></div><h3>{project.name}</h3><p title={project.notes}>Site listed by {project.owner} · {project.siteType}</p><span className="project-permission"><ShieldCheck size={12} /> {project.permission}</span><div className="project-metrics"><div><span>Est. capacity</span><b>{project.capacity} <small>kW</small></b></div><div><span>Available area</span><b>{project.area} <small>m²</small></b></div><div><span>Funding target</span><b>{formatUSD(project.target)}</b></div></div><div className="funding-progress-head"><span>Non-cash pledges · {contributions.filter((item) => item.projectId === project.id).length} records from your account</span><b>{pct(project.raised, project.target)}%</b></div><div className="progress-track"><i style={{ width: `${pct(project.raised, project.target)}%` }} /></div><div className="funding-amount"><span>{formatUSD(project.raised)} <small>pledged</small></span><span>{formatUSD(project.target - project.raised)} <small>remaining</small></span></div><button className="button button-secondary project-action" disabled={project.status !== 'Funding'} onClick={() => onFund(project)}>{project.status === 'Review' || project.status === 'Draft' ? 'Awaiting site approval / publication' : project.raised >= project.target ? 'Pledge target reached' : project.status === 'Funding' ? 'Record a pledge' : 'Pledging unavailable'} <ArrowRight size={15} /></button>{mockApiEnabled && <button className="button button-outline project-action" onClick={() => onOpen(project.id)}>Open project workspace <ArrowRight size={15} /></button>}</div></article>)}</div>}{mockApiEnabled && workspaceId && <SolarProjectWorkspace key={workspaceId} projectId={workspaceId} role={role} identity={identity} onClose={onCloseWorkspace} onNotify={onNotify} onRefresh={onRefresh} />}<div className="solar-disclaimer"><ShieldCheck size={15} /><span>Capacity and funding estimates depend on user-entered assumptions. Pledges do not move money or represent investments; no returns or payouts are supported. Solar estimates are not engineering guarantees.</span></div></div>
 }
 
 function ActivityPage({ activity, onCopy }: { activity: AppState['activity']; onCopy: (text: string) => void }) {
-  return <div className="page-stack"><section className="panel list-page-panel"><div className="panel-heading"><div><span className="section-kicker">TRANSPARENT BY DEFAULT</span><h2>Activity & audit trail</h2><p>Application events are shown separately from any simulated chain references.</p></div><button className="button button-outline" onClick={() => onCopy(JSON.stringify(activity, null, 2))}><Download size={15} /> Copy report</button></div><div className="timeline-list">{activity.map((event, index) => <div className="timeline-item" key={`${event.title}-${index}`}><span className={`timeline-node ${index === 0 ? 'latest' : ''}`}><Activity size={14} /></span><div><b>{event.title}</b><p>{event.detail}</p><small>{event.time} · Application event · wallet account</small></div><button className="icon-button tiny" aria-label="Copy event" onClick={() => onCopy(`${event.title} — ${event.detail}`)}><Copy size={14} /></button></div>)}{activity.length === 0 && <div className="empty-state"><ClipboardCheck size={25} /><h3>No activity yet</h3><p>Actions you take will appear here.</p></div>}</div><div className="audit-legend"><span><i className="legend-dot app-event" /> Application event</span><span><i className="legend-dot chain-event" /> Chain data: not connected</span></div></section></div>
+  return <div className="page-stack"><section className="panel list-page-panel"><div className="panel-heading"><div><span className="section-kicker">TRANSPARENT BY DEFAULT</span><h2>Activity & audit trail</h2><p>Application events are shown separately from any simulated chain references.</p></div><button className="button button-outline" onClick={() => onCopy(JSON.stringify(activity, null, 2))}><Download size={15} /> Copy report</button></div><div className="timeline-list">{activity.map((event, index) => <div className="timeline-item" key={`${event.title}-${index}`}><span className={`timeline-node ${index === 0 ? 'latest' : ''}`}><Activity size={14} /></span><div><b>{event.title}</b><p>{event.detail}</p><small>{event.time} · Wallet account event</small></div><button className="icon-button tiny" aria-label="Copy event" onClick={() => onCopy(`${event.title} — ${event.detail}`)}><Copy size={14} /></button></div>)}{activity.length === 0 && <div className="empty-state"><ClipboardCheck size={25} /><h3>No activity yet</h3><p>Actions you take will appear here.</p></div>}</div><div className="audit-legend"><span><i className="legend-dot app-event" /> Application event</span><span><i className="legend-dot chain-event" /> Chain data: not connected</span></div></section></div>
 }
 
 function SettingsPage({ role, walletConnected, walletAddress, walletChainId, configuredChainId, contractAddress, theme, setTheme, onCopy, onSignOut, onRequestRemove, onStartTour, onReset }: {
@@ -1589,8 +1631,8 @@ function SettingsPage({ role, walletConnected, walletAddress, walletChainId, con
         <div>
           <span className="section-kicker">ACCOUNT</span>
           <h2>Profile & role</h2>
-          <p>Wallet roles are stored on your account. Privileged verifier and administrator permissions are assigned by an operator.</p>
-          <div className="settings-field">Current role<b>{role}</b></div>
+          <p>Your role is bound to this wallet profile. Verifier and administrator access is assigned only by an operator allowlist.</p>
+          <div className="settings-field">Wallet role <b>{role}</b></div>
           <div className="settings-note"><CircleHelp size={15} /> {walletConnected ? 'An EVM wallet is connected. Bright Ledger never receives its private key.' : 'No wallet is connected. Wallet sign-in requests a signature, never a private key.'}</div>
           {walletConnected && <div className="web3-profile">
             <div><span>Wallet address</span><code>{walletAddress}</code><button className="text-link" onClick={() => onCopy(walletAddress)}><Copy size={13} /> Copy address</button></div>
@@ -1628,7 +1670,7 @@ function SettingsPage({ role, walletConnected, walletAddress, walletChainId, con
         <div>
           <span className="section-kicker">SERVER DATA</span>
           <h2>Refresh shared records</h2>
-          <p>Reload the latest account records and notifications from the PostgreSQL-backed API.</p>
+          <p>Reload account-scoped records and notifications from the PostgreSQL-backed API.</p>
           <button className="button button-danger-outline" onClick={onReset}>Refresh from server</button>
         </div>
       </section>
@@ -1661,8 +1703,8 @@ function Modal({ kind, onClose, onListing, onProject, onEstimateProject, onMatch
   const [fundingEstimate, setFundingEstimate] = useState<ProjectFundingEstimate | null>(null)
   const [fundingEstimateBusy, setFundingEstimateBusy] = useState(false)
   const [fundingEstimateError, setFundingEstimateError] = useState('')
-  const heading = kind === 'listing' ? 'Create an energy listing' : kind === 'project' ? 'List a solar-ready site' : kind === 'match' ? listing?.type === 'request' ? 'Review request match proposal' : 'Review match proposal' : kind === 'fund' ? 'Simulate a contribution' : 'Evidence review'
-  const subheading = kind === 'listing' ? 'Share energy with your local microgrid.' : kind === 'project' ? 'Add a site for community solar discovery.' : kind === 'match' ? 'Check the terms before confirming a match.' : kind === 'fund' ? 'Preview contributions do not move money or represent investments.' : 'Inspect the submitted reading and its verification state.'
+  const heading = kind === 'listing' ? 'Create an energy listing' : kind === 'project' ? 'List a solar-ready site' : kind === 'match' ? listing?.type === 'request' ? 'Review request match proposal' : 'Review match proposal' : kind === 'fund' ? 'Record a non-cash pledge' : 'Evidence review'
+  const subheading = kind === 'listing' ? 'Share energy with your local microgrid.' : kind === 'project' ? 'Add a site for community solar discovery.' : kind === 'match' ? 'Check the terms before confirming a match.' : kind === 'fund' ? 'A pledge is an expression of interest; no money is transferred.' : 'Inspect the submitted reading and its verification state.'
   function requestAiReview(event: React.MouseEvent<HTMLButtonElement>) {
     const form = event.currentTarget.form
     const fileInput = form?.querySelector<HTMLInputElement>('input[name="evidenceFile"]')
@@ -1755,14 +1797,14 @@ function Modal({ kind, onClose, onListing, onProject, onEstimateProject, onMatch
         <p><b>AI advisory · {fundingEstimate.aiReview.confidence} confidence</b><br />{fundingEstimate.aiReview.summary}</p>
         {fundingEstimate.aiReview.flags.length > 0 && <div><b>Assumptions to check</b><ul>{fundingEstimate.aiReview.flags.map((item) => <li key={item}>{item}</li>)}</ul></div>}
         {fundingEstimate.aiReview.suggestedChecks.length > 0 && <div><b>Suggested verification</b><ul>{fundingEstimate.aiReview.suggestedChecks.map((item) => <li key={item}>{item}</li>)}</ul></div>}
-        <div className="funding-share-suggestion"><span>AI-proposed revenue split · not financial advice</span><b>Owner {fundingEstimate.aiReview.suggestedRevenueShares.owner}% · Funder {fundingEstimate.aiReview.suggestedRevenueShares.funder}% · Community {fundingEstimate.aiReview.suggestedRevenueShares.community}%</b><button type="button" className="text-link" onClick={(event) => { const form = event.currentTarget.form; if (!form) return; const shares = fundingEstimate.aiReview.suggestedRevenueShares; for (const [name, value] of Object.entries({ ownerShare: shares.owner, funderShare: shares.funder, communityShare: shares.community })) { const field = form.elements.namedItem(name); if (field instanceof HTMLInputElement) { field.value = String(value); field.dispatchEvent(new Event('input', { bubbles: true })) } } }}>Apply suggested split</button></div>
+        <div className="funding-share-suggestion"><span>AI-proposed revenue split · not financial advice</span><b>Owner {fundingEstimate.aiReview.suggestedRevenueShares.owner}% · Funder {fundingEstimate.aiReview.suggestedRevenueShares.funder}% · Community {fundingEstimate.aiReview.suggestedRevenueShares.community}%</b><button type="button" className="text-link" onClick={(event) => { const form = event.currentTarget.form; if (!form) return; const shares = fundingEstimate.aiReview.suggestedRevenueShares; for (const [name, value] of Object.entries({ ownerShare: shares.owner, funderShare: shares.funder, communityShare: shares.community })) { const field = form.elements.namedItem(name); if (field instanceof HTMLInputElement) field.value = String(value) } }}>Apply suggested split</button></div>
         <small>{fundingEstimate.aiReview.model} · review the assumptions and choose all shares yourself before publishing.</small>
       </div>}
-      <div className="modal-disclosure"><ShieldCheck size={15} /> Funding estimates use your cost entries and saved AI review. Test contributions create database records only; they do not move money. New sites require human review.</div>
+      <div className="modal-disclosure"><ShieldCheck size={15} /> Funding estimates use your cost entries; pledges are recorded in the database but do not move money. New sites require human review.</div>
       <div className="modal-actions"><button type="button" className="button button-outline" onClick={onClose}>Cancel</button><button type="submit" className="button button-primary">Submit site for review <ArrowRight size={15} /></button></div>
     </form>}
     {kind === 'match' && listing && <form className="modal-form" onSubmit={onMatch}><div className="match-summary"><div className="listing-avatar">{listing.owner.split(' ').map((part) => part[0]).join('').slice(0, 2)}</div><div><b>{listing.owner}</b><span>{listing.area} · {listing.source}</span></div><Status status="Open" /></div><div className="match-term-row"><span>Available energy</span><b>{listing.quantity} kWh</b></div><div className="match-term-row"><span>Agreed unit price</span><b>${listing.price.toFixed(2)} / kWh</b></div><label>Quantity to request<input name="quantity" type="number" min="0.1" max={listing.quantity} step="0.1" defaultValue={Math.min(5, listing.quantity)} required /><small>Cannot exceed the available listing quantity.</small></label><div className="match-estimate"><span>Illustrative total · not a payment</span><b>${(listing.price * Math.min(5, listing.quantity)).toFixed(2)}</b></div><div className="modal-disclosure"><ShieldCheck size={15} /> A match reserves listing quantity. No payment or electricity delivery occurs.</div><div className="modal-actions"><button type="button" className="button button-outline" onClick={onClose}>Cancel</button><button type="submit" className="button button-primary">{listing.type === 'offer' ? 'Request match' : 'Propose match'} <ArrowRight size={15} /></button></div></form>}
-    {kind === 'fund' && project && <form className="modal-form" onSubmit={onFund}><div className="fund-project-summary"><div className="project-mini-sun"><Sun size={22} /></div><div><b>{project.name}</b><span>{project.location}</span></div></div><div className="fund-progress-line"><span>Current reported contributions</span><b>{pct(project.raised, project.target)}%</b></div><div className="progress-track"><i style={{ width: `${pct(project.raised, project.target)}%` }} /></div><div className="funding-amount"><span>{formatUSD(project.raised)} <small>recorded</small></span><span>{formatUSD(project.target - project.raised)} <small>remaining</small></span></div><label>Test contribution<input name="amount" type="number" min="1" max={project.target - project.raised} step="1" placeholder="e.g. 250" required /><small>USD · recorded as a non-cash database entry</small></label><div className="modal-disclosure"><ShieldCheck size={15} /> Not an investment, payment, or promise of financial return.</div><div className="modal-actions"><button type="button" className="button button-outline" onClick={onClose}>Cancel</button><button type="submit" className="button button-primary">Record test contribution <ArrowRight size={15} /></button></div></form>}
+    {kind === 'fund' && project && <form className="modal-form" onSubmit={onFund}><div className="fund-project-summary"><div className="project-mini-sun"><Sun size={22} /></div><div><b>{project.name}</b><span>{project.location}</span></div></div><div className="fund-progress-line"><span>Recorded pledges</span><b>{pct(project.raised, project.target)}%</b></div><div className="progress-track"><i style={{ width: `${pct(project.raised, project.target)}%` }} /></div><div className="funding-amount"><span>{formatUSD(project.raised)} <small>pledged</small></span><span>{formatUSD(project.target - project.raised)} <small>remaining</small></span></div><label>Pledge amount<input name="amount" type="number" min="1" max={project.target - project.raised} step="1" placeholder="e.g. 250" required /><small>USD · recorded as a non-cash pledge; no payment is made</small></label><div className="modal-disclosure"><ShieldCheck size={15} /> This is not an investment, payment, or promise of financial return.</div><div className="modal-actions"><button type="button" className="button button-outline" onClick={onClose}>Cancel</button><button type="submit" className="button button-primary">Record pledge <ArrowRight size={15} /></button></div></form>}
     {kind === 'evidence' && !evidence && trade && <form className="modal-form" onSubmit={(event) => onEvidenceSubmit(event, trade)}><div className="match-summary"><div className="listing-avatar"><Sun size={15} /></div><div><b>{trade.id} · {trade.quantity} kWh</b><span>Delivery evidence for {trade.seller}</span></div><Status status={trade.status} /></div><label>Reported energy delivered<input name="quantity" type="number" min="0.1" max={trade.quantity} step="0.1" defaultValue={trade.quantity} required /><small>kWh · cannot exceed the committed trade quantity</small></label><div className="form-row"><label>Evidence source<input name="source" maxLength={120} placeholder="Meter, inverter, manual reading source" required /></label><label>Reading interval<select name="interval"><option>Current reading interval</option><option>Previous reading interval</option></select></label></div><label>Meter or inverter evidence<input name="evidenceFile" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf,.csv,image/jpeg,image/png,image/webp,application/pdf,text/csv" onChange={onEvidenceFileChange} /><small>JPEG, PNG, WebP, PDF or UTF-8 CSV · maximum 8 MB · stored with this PostgreSQL record and available only to trade participants and authorized verifiers.</small></label><label className="ai-consent"><input name="aiConsent" type="checkbox" /> I consent to sending this file to OpenRouter for advisory AI analysis. Provider data-handling policies apply.</label><div className="ai-review-controls"><button type="button" className="button button-secondary" onClick={requestAiReview} disabled={aiEvidenceLoading}>{aiEvidenceLoading ? 'Checking evidence…' : 'Run AI evidence check'} <ShieldCheck size={15} /></button><span>Advisory only · never auto-approved</span></div>{aiEvidenceReview && <div className="ai-review-result" role="status"><b>AI triage · {aiEvidenceReview.analysis.confidence} confidence</b><p>{aiEvidenceReview.analysis.summary}</p>{aiEvidenceReview.analysis.flags.length > 0 && <div><span>Potential issues to inspect</span><ul>{aiEvidenceReview.analysis.flags.map((flag) => <li key={flag}>{flag}</li>)}</ul></div>}<div><span>Suggested human checks</span><ul>{aiEvidenceReview.analysis.suggestedChecks.map((check) => <li key={check}>{check}</li>)}</ul></div><small>Model: {aiEvidenceReview.model} · File SHA-256: {aiEvidenceReview.fileSha256} · Review is not proof of authenticity, generation, or delivery.</small></div>}<div className="modal-disclosure"><ShieldCheck size={15} /> The file is stored in the app database on submission. It is sent to OpenRouter only when you request AI review and consent. A verifier must make the final review decision before settlement.</div><div className="modal-actions"><button type="button" className="button button-outline" onClick={onClose}>Cancel</button><button type="submit" className="button button-primary">Submit evidence <ArrowRight size={15} /></button></div></form>}
     {kind === 'evidence' && evidence && <div className="modal-form">
       <div className="evidence-detail-callout"><ShieldCheck size={20} /><span><b>{evidence.id} · {evidence.source}</b><small>Reading record · not independently verified</small></span><Status status={evidence.status} /></div>

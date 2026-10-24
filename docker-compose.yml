@@ -63,7 +63,6 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-brightledger-local}
       AUTH_URI: http://localhost:5173
       AUTH_DOMAIN: Bright Ledger
-      SEED_SAMPLE_DATA: "true"
       API_ORIGIN: http://localhost:5173
       CHAIN_RPC_URL: http://blockchain:8545
       CHAIN_ID: "31337"

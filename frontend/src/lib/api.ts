@@ -1,5 +1,5 @@
+const tokenKey = 'bright-ledger-access-token'
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') ?? ''
-let accessToken: string | null = null
 
 declare global {
   interface Window {
@@ -26,21 +26,27 @@ export class ApiError extends Error {
 }
 
 export function clearAccessToken() {
-  accessToken = null
+  sessionStorage.removeItem(tokenKey)
+  localStorage.removeItem(tokenKey)
+}
+
+export function clearLegacyAccessToken() {
+  localStorage.removeItem(tokenKey)
 }
 
 export function hasAccessToken() {
-  return Boolean(accessToken)
+  return Boolean(sessionStorage.getItem(tokenKey))
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const token = sessionStorage.getItem(tokenKey)
   let response: Response
   try {
     response = await fetch(`${apiBaseUrl}${path}`, {
       ...options,
       headers: {
         ...(options.body instanceof FormData ? {} : { 'content-type': 'application/json' }),
-        ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
         ...options.headers,
       },
     })
@@ -49,13 +55,17 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   }
   const body = await response.json().catch(() => null) as { error?: { message?: string; code?: string } } | null
   if (!response.ok) {
+    if (response.status === 401) {
+      clearAccessToken()
+      window.dispatchEvent(new Event('bright-ledger:unauthorized'))
+    }
     throw new ApiError(body?.error?.message ?? `Request failed (${response.status}).`, response.status, body?.error?.code)
   }
   return body as T
 }
 
-export async function signInWallet(displayName: string, role: 'prosumer' | 'consumer' | 'both') {
-  if (!window.ethereum) throw new ApiError('No injected EVM wallet was found. Install a compatible wallet to continue.', 0, 'WALLET_NOT_FOUND')
+export async function signInWallet(displayName: string, role: 'prosumer' | 'consumer' | 'both' | 'funder') {
+  if (!window.ethereum) throw new ApiError('No injected EVM wallet was found. Install a compatible EVM wallet to continue.', 0, 'WALLET_NOT_FOUND')
   const { BrowserProvider, getAddress } = await import('ethers')
   const provider = new BrowserProvider(window.ethereum)
   const accounts = await provider.send('eth_requestAccounts', []) as string[]
@@ -66,12 +76,16 @@ export async function signInWallet(displayName: string, role: 'prosumer' | 'cons
   })
   const signer = await provider.getSigner(address)
   const signature = await signer.signMessage(challenge.message)
-  const result = await request<{ accessToken: string; user: { id: string; role: string; displayName: string; walletAddress: string | null; demo: boolean } }>('/api/auth/verify', {
+  const result = await request<{ accessToken: string; user: { id: string; role: string; displayName: string; walletAddress: string | null } }>('/api/auth/verify', {
     method: 'POST',
     body: JSON.stringify({ address, nonce: challenge.nonce, signature, displayName, role }),
   })
-  accessToken = result.accessToken
+  sessionStorage.setItem(tokenKey, result.accessToken)
   return result.user
+}
+
+export function revokeWalletSession() {
+  return apiDelete<void>('/api/auth/session')
 }
 
 export async function removeWalletAccountWithSignature(expectedAddress: string) {
@@ -90,7 +104,7 @@ export async function removeWalletAccountWithSignature(expectedAddress: string) 
 }
 
 export function getCurrentUser() {
-  return request<{ id: string; role: string; displayName: string; walletAddress: string | null; demo: boolean }>('/api/me')
+  return request<{ id: string; role: string; displayName: string; walletAddress: string }>('/api/me')
 }
 
 export function apiGet<T>(path: string) {
@@ -106,25 +120,26 @@ export function apiUpload<T>(path: string, body: FormData) {
 }
 
 export async function apiGetBlob(path: string) {
+  const token = sessionStorage.getItem(tokenKey)
   let response: Response
   try {
     response = await fetch(`${apiBaseUrl}${path}`, {
-      headers: accessToken ? { authorization: `Bearer ${accessToken}` } : {},
+      headers: token ? { authorization: `Bearer ${token}` } : {},
     })
   } catch {
     throw new ApiError('Bright Ledger API is unreachable. Start the API service and try again.', 0, 'API_UNAVAILABLE')
   }
   if (!response.ok) {
     const body = await response.json().catch(() => null) as { error?: { message?: string; code?: string } } | null
+    if (response.status === 401) {
+      clearAccessToken()
+      window.dispatchEvent(new Event('bright-ledger:unauthorized'))
+    }
     throw new ApiError(body?.error?.message ?? `Request failed (${response.status}).`, response.status, body?.error?.code)
   }
   const disposition = response.headers.get('content-disposition') ?? ''
   const fileName = disposition.match(/filename="([a-zA-Z0-9._-]{1,120})"/)?.[1] ?? 'evidence-file'
   return { blob: await response.blob(), fileName }
-}
-
-export function revokeCurrentSession() {
-  return request<void>('/api/auth/session', { method: 'DELETE' })
 }
 
 export function apiPatch<T>(path: string, body: unknown) {
