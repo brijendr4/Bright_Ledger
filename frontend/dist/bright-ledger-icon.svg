@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-labelledby="title">
+  <title id="title">Bright Ledger solar mark</title>
+  <defs>
+    <linearGradient id="sun" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#ffd34e"/>
+      <stop offset="1" stop-color="#d69b28"/>
+    </linearGradient>
+    <clipPath id="circle"><circle cx="48" cy="48" r="40"/></clipPath>
+  </defs>
+  <circle cx="48" cy="48" r="43" fill="#0b3932"/>
+  <circle cx="48" cy="48" r="37" fill="none" stroke="url(#sun)" stroke-width="2.6"/>
+  <g stroke="#efbb36" stroke-width="3" stroke-linecap="round">
+    <path d="M48 10v9M27 16l5 8M14 31l8 4M69 16l-5 8M82 31l-8 4M10 47h9M77 47h9"/>
+  </g>
+  <g clip-path="url(#circle)">
+    <path d="M18 48a30 30 0 0 1 60 0H18Z" fill="url(#sun)"/>
+    <path d="M7 49h82" stroke="#f3c34d" stroke-width="3"/>
+    <path d="M7 54h82l-7 38H12Z" fill="#eff3e8"/>
+    <path d="M13 57h69l-6 32H18Z" fill="#174c3e"/>
+    <path d="m26 57 17 32m9-32 8 32m16-32-1 32M15 72h62M18 84h56" fill="none" stroke="#f0f2e8" stroke-width="2"/>
+  </g>
+</svg>
