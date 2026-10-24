@@ -1,0 +1,111 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: brightledger
+      POSTGRES_USER: brightledger
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-brightledger-local}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - bright-ledger-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U brightledger -d brightledger"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  blockchain:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bright-ledger-local
+    init: true
+    restart: unless-stopped
+    command: ["sh", "blockchain/scripts/start-container.sh"]
+    environment:
+      CHAIN_RPC_URL: http://127.0.0.1:8545
+      CHAIN_ID: "31337"
+      CONTRACT_ADDRESS_FILE: /runtime/contract-address
+    ports:
+      - "127.0.0.1:8545:8545"
+    volumes:
+      - bright-ledger-chain:/runtime
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8545',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',method:'eth_chainId',params:[],id:1})}).then(async r=>{const j=await r.json();if(j.result!=='0x7a69'||!require('fs').existsSync('/runtime/contract-address'))process.exit(1)}).catch(()=>process.exit(1))"
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bright-ledger-local
+    init: true
+    restart: unless-stopped
+    command:
+      - sh
+      - -c
+      - |
+        while [ ! -s /runtime/contract-address ]; do sleep 1; done
+        export CONTRACT_ADDRESS="$$(cat /runtime/contract-address)"
+        exec npm run dev:backend
+    environment:
+      API_PORT: "4000"
+      DATABASE_URL: postgresql://brightledger:${POSTGRES_PASSWORD:-brightledger-local}@postgres:5432/brightledger
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-brightledger-local}
+      AUTH_URI: http://localhost:5173
+      AUTH_DOMAIN: Bright Ledger
+      SEED_SAMPLE_DATA: "true"
+      API_ORIGIN: http://localhost:5173
+      CHAIN_RPC_URL: http://blockchain:8545
+      CHAIN_ID: "31337"
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-nvidia/nemotron-3.5-super-vl:free}
+    ports:
+      - "127.0.0.1:4000:4000"
+    volumes:
+      - bright-ledger-chain:/runtime:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      blockchain:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:4000/api/health').then(async r=>{const j=await r.json();if(!r.ok||j.status!=='ok'||j.database!=='connected'||!j.blockchain.enabled||!j.blockchain.connected)process.exit(1)}).catch(()=>process.exit(1))"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bright-ledger-local
+    init: true
+    restart: unless-stopped
+    command: ["npm", "run", "dev:frontend"]
+    environment:
+      API_PROXY_TARGET: http://backend:4000
+      VITE_API_BASE_URL: ""
+    ports:
+      - "127.0.0.1:5173:5173"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  bright-ledger-postgres:
+  bright-ledger-chain:

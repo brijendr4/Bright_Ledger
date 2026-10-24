@@ -1,0 +1,33 @@
+{
+  "name": "bright-ledger",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "frontend",
+    "backend",
+    "blockchain"
+  ],
+  "scripts": {
+    "start:local": "docker compose up --build",
+    "dev": "concurrently -k -n API,WEB -c blue,green \"npm:dev:backend\" \"npm:dev:frontend\"",
+    "dev:backend": "npm run dev --workspace @bright-ledger/backend",
+    "dev:frontend": "npm run dev --workspace @bright-ledger/frontend",
+    "start:backend": "npm run start --workspace @bright-ledger/backend",
+    "build": "npm run build:frontend && npm run build:backend",
+    "build:frontend": "npm run build --workspace @bright-ledger/frontend",
+    "build:backend": "npm run build --workspace @bright-ledger/backend",
+    "typecheck:backend": "npm run typecheck --workspace @bright-ledger/backend",
+    "lint": "oxlint frontend/src backend/src blockchain",
+    "test:backend": "npm run test --workspace @bright-ledger/backend",
+    "chain:node": "npm run node --workspace @bright-ledger/blockchain",
+    "chain:compile": "npm run compile --workspace @bright-ledger/blockchain",
+    "chain:test": "npm run test --workspace @bright-ledger/blockchain",
+    "chain:deploy": "npm run deploy --workspace @bright-ledger/blockchain",
+    "preview": "npm run preview --workspace @bright-ledger/frontend"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.6",
+    "oxlint": "^1.88.0"
+  }
+}
