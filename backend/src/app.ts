@@ -962,7 +962,7 @@ api.use((_request, _response, next) => next(new HttpError(404, 'API endpoint not
 api.use(errorHandler)
 
 export async function startServer() {
-  const port = Number(process.env.API_PORT ?? 4000)
+  const port = Number(process.env.PORT ?? process.env.API_PORT ?? 4000)
   return api.listen(port, '0.0.0.0', () => console.log(`Bright Ledger API listening on :${port}`))
 }
 
