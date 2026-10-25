@@ -14,6 +14,7 @@ import { findCompatibleMatch, type MatchListing } from './market-policy.js'
 import { getMarketBenchmark } from './market-benchmark.js'
 import { inspectEvidenceFile, reviewEvidenceFile } from './evidence-ai.js'
 import { calculateSolarFunding, reviewSolarFundingPlan, solarFundingInputSchema } from './solar-funding-ai.js'
+import { calculateSimulatedIncomeAllocations } from './project-income.js'
 
 const api = express()
 function routeId(request: express.Request): string {
@@ -190,6 +191,14 @@ api.get('/api/bootstrap', asyncRoute(async (request, response) => {
         estimate.estimate->>'limitation' AS "estimateLimitation",
         coalesce(sum(c.amount) FILTER (WHERE c.status IN ('simulated','confirmed','pledged')),0) AS raised,
         p.permission_status AS permission,p.notes,p.status,
+        p.revenue_share_json AS "revenueShares",
+        coalesce((
+          SELECT json_agg(json_build_object(
+            'id',d.public_id,'amountMinor',d.amount_minor,'source',d.source,
+            'createdAt',d.created_at,'allocations',d.allocations
+          ) ORDER BY d.created_at DESC)
+          FROM project_income_distributions d WHERE d.project_id=p.id
+        ),'[]'::json) AS "incomeDistributions",
         count(c.id) FILTER (WHERE c.status IN ('simulated','confirmed','pledged'))::int AS "contributionCount"
        FROM projects p
        JOIN solar_funding_estimates estimate ON estimate.project_id=p.id
@@ -792,7 +801,14 @@ api.get('/api/projects', asyncRoute(async (_request, response) => {
       estimate.estimate->>'limitation' AS "estimateLimitation",
       coalesce(sum(c.amount) FILTER (WHERE c.status IN ('simulated','confirmed','pledged')),0) AS raised,
       p.permission_status AS permission,p.notes,p.status,p.agreement_version AS "agreementVersion",
-      p.energy_share_json AS "energyShares",p.revenue_share_json AS "revenueShares"
+      p.energy_share_json AS "energyShares",p.revenue_share_json AS "revenueShares",
+      coalesce((
+        SELECT json_agg(json_build_object(
+          'id',d.public_id,'amountMinor',d.amount_minor,'source',d.source,
+          'createdAt',d.created_at,'allocations',d.allocations
+        ) ORDER BY d.created_at DESC)
+        FROM project_income_distributions d WHERE d.project_id=p.id
+      ),'[]'::json) AS "incomeDistributions"
      FROM projects p
      JOIN solar_funding_estimates estimate ON estimate.project_id=p.id
        AND estimate.ai_analysis ? 'summary' AND estimate.estimate ? 'requiredFundingMinor'
@@ -803,9 +819,6 @@ api.get('/api/projects', asyncRoute(async (_request, response) => {
 }))
 
 api.post('/api/projects', asyncRoute(async (request, response) => {
-  if (!['space_owner', 'admin'].includes(request.user!.role)) {
-    throw new HttpError(403, 'Choose an energy-host profile to submit a community solar site.', 'ROLE_NOT_ALLOWED')
-  }
   const input = z.object({
     name: z.string().trim().min(3).max(120),
     location: z.string().trim().min(2).max(160),
@@ -836,7 +849,6 @@ api.post('/api/projects', asyncRoute(async (request, response) => {
       )
       const savedEstimate = estimate.rows[0]
       if (!savedEstimate) throw new HttpError(404, 'Funding estimate not found or already used.', 'FUNDING_ESTIMATE_NOT_FOUND')
-      if (!savedEstimate.aiModel.trim()) throw new HttpError(409, 'A completed AI-reviewed estimate is required before publishing a solar project.', 'FUNDING_ESTIMATE_INCOMPLETE')
       const estimatedShares = savedEstimate.estimatedShares
       if (
         Number(savedEstimate.usableAreaM2) !== input.area ||
@@ -897,13 +909,22 @@ api.post('/api/projects/:id/review', allowRoles('verifier', 'admin'), asyncRoute
   response.json({ data: result })
 }))
 
-api.post('/api/projects/funding-estimates', allowRoles('space_owner', 'admin'), asyncRoute(async (request, response) => {
-  if (request.body?.consentToAi !== true) {
-    throw new HttpError(400, 'Confirm that this project information may be sent to the configured AI provider.', 'AI_REVIEW_CONSENT_REQUIRED')
-  }
+api.post('/api/projects/funding-estimates', asyncRoute(async (request, response) => {
+  const consentToAi = request.body?.consentToAi === true
   const input = solarFundingInputSchema.parse(request.body)
   const estimate = calculateSolarFunding(input)
-  const review = await reviewSolarFundingPlan(input, estimate)
+  const review = consentToAi
+    ? await reviewSolarFundingPlan(input, estimate)
+    : {
+      model: 'Not requested',
+      analysis: {
+        summary: 'AI review was not requested. Project assumptions are submitted for human review.',
+        confidence: 'low' as const,
+        flags: [],
+        suggestedChecks: ['Review site permission and user-entered cost assumptions.'],
+        suggestedRevenueShares: input.revenueShares,
+      },
+    }
   const saved = await transaction(async (client) => {
     const inserted = await client.query<{ id: string }>(
       `INSERT INTO solar_funding_estimates(created_by,input,estimate,ai_model,ai_analysis)
@@ -962,6 +983,85 @@ api.post('/api/projects/:id/contributions', asyncRoute(async (request, response)
     return { ...inserted.rows[0], duplicate: false }
   })
   response.status(result.duplicate ? 200 : 201).json({ data: { ...result, amount: Number(result.amount) } })
+}))
+
+api.post('/api/projects/:id/income-distributions', asyncRoute(async (request, response) => {
+  const input = z.object({
+    amountUsd: z.number().positive().max(100_000_000),
+    source: z.string().trim().min(3).max(200),
+    idempotencyKey: z.string().uuid(),
+  }).parse(request.body)
+  const amountMinor = Math.round(input.amountUsd * 100)
+  if (!Number.isSafeInteger(amountMinor) || amountMinor <= 0) {
+    throw new HttpError(400, 'Enter a valid simulated income amount in USD.', 'INVALID_INCOME_AMOUNT')
+  }
+  const result = await transaction(async (client) => {
+    const projectResult = await client.query<{
+      id: string
+      name: string
+      owner: string
+      status: string
+      revenueShares: { owner: number; funder: number; community: number }
+    }>(
+      `SELECT p.id,p.name,u.display_name AS owner,p.status,p.revenue_share_json AS "revenueShares"
+       FROM projects p JOIN users u ON u.id=p.owner_id
+       WHERE p.public_id=$1 FOR UPDATE OF p`,
+      [routeId(request)],
+    )
+    const project = projectResult.rows[0]
+    if (!project) throw new HttpError(404, 'Project not found.', 'PROJECT_NOT_FOUND')
+    if (!['funding', 'operational'].includes(project.status)) {
+      throw new HttpError(409, 'Simulated income can only be recorded for an approved, active project.', 'PROJECT_NOT_ACTIVE')
+    }
+    const prior = await client.query<{ id: string; projectId: string; amountMinor: string; source: string }>(
+      `SELECT d.public_id AS id,d.project_id AS "projectId",d.amount_minor AS "amountMinor",d.source
+       FROM project_income_distributions d WHERE d.idempotency_key=$1`,
+      [input.idempotencyKey],
+    )
+    if (prior.rows[0]) {
+      const priorRecord = prior.rows[0]
+      if (priorRecord.projectId !== project.id || Number(priorRecord.amountMinor) !== amountMinor || priorRecord.source !== input.source) {
+        throw new HttpError(409, 'This request key was already used for a different income record.', 'IDEMPOTENCY_KEY_REUSED')
+      }
+      return { id: priorRecord.id, duplicate: true }
+    }
+    const contributorResult = await client.query<{ id: string; name: string; amountMinor: string }>(
+      `SELECT u.id,u.display_name AS name,round(sum(c.amount) * 100)::bigint AS "amountMinor"
+       FROM contributions c JOIN users u ON u.id=c.contributor_id
+       WHERE c.project_id=$1 AND c.status IN ('simulated','confirmed','pledged')
+       GROUP BY u.id,u.display_name ORDER BY u.id`,
+      [project.id],
+    )
+    const allocations = calculateSimulatedIncomeAllocations(
+      amountMinor,
+      project.revenueShares,
+      project.owner,
+      contributorResult.rows.map((investor) => ({
+        id: investor.id,
+        name: investor.name,
+        amountMinor: Number(investor.amountMinor),
+      })),
+    )
+    const publicId = `INC-${randomUUID().slice(0, 8).toUpperCase()}`
+    await client.query(
+      `INSERT INTO project_income_distributions(
+        public_id,project_id,recorded_by,amount_minor,source,revenue_shares,allocations,idempotency_key
+      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [
+        publicId, project.id, request.user!.id, amountMinor, input.source,
+        JSON.stringify(project.revenueShares), JSON.stringify(allocations), input.idempotencyKey,
+      ],
+    )
+    await writeAudit(client, request.user!.id, 'project.simulated_income_distributed', 'project', routeId(request), {
+      distributionId: publicId,
+      amountMinor,
+      source: input.source,
+      allocations,
+      noPayment: true,
+    })
+    return { id: publicId, duplicate: false }
+  })
+  response.status(result.duplicate ? 200 : 201).json({ data: result })
 }))
 
 api.get('/api/projects/:id/settlement-preview', asyncRoute(async (request, response) => {

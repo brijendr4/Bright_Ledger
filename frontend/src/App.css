@@ -525,6 +525,7 @@
 .solar-record-list small, .solar-trade-row small, .solar-dispute-row small { color: var(--muted); font-size: 8px; line-height: 1.5; overflow-wrap: anywhere; }
 .solar-generation-row { flex-wrap: wrap; }
 .solar-generation-row > span:first-child { flex-basis: 100%; }
+.project-income-panel { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }.project-income-panel > summary { color: #467e5a; cursor: pointer; font-size: 9px; font-weight: 700; }.project-income-panel > p { margin: 7px 0; color: var(--muted); font-size: 8px; line-height: 1.5; }.project-income-records { display: grid; gap: 8px; margin-top: 10px; }.project-income-records > div { display: grid; gap: 4px; padding: 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--card-soft); }.project-income-records b { font-size: 8px; }.project-income-records small { color: var(--muted); font-size: 7px; line-height: 1.45; overflow-wrap: anywhere; }
 .solar-inline-form { display: grid; gap: 9px; padding: 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--card-soft); }
 .solar-inline-form label { display: grid; gap: 5px; color: var(--muted); font-size: 8px; }
 .solar-inline-form input, .solar-inline-form select, .solar-inline-form textarea { width: 100%; min-width: 0; min-height: 33px; padding: 7px 8px; border: 1px solid var(--border); border-radius: 6px; outline: none; background: var(--card); color: var(--ink); font: inherit; font-size: 9px; }

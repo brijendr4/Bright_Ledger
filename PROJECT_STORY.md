@@ -21,7 +21,7 @@ Bright Ledger brings several related workflows together:
 - **Energy marketplace:** Energy Producers can publish offers and Energy Consumers can submit requests with quantities, prices, locations, energy sources, and delivery windows.
 - **Explainable matching:** Rules compare location, available quantity, price limits, and delivery timing to identify compatible listings.
 - **Documented trade flow:** Participants confirm trade terms; the buyer funds testnet escrow; the seller submits delivery evidence; and the buyer can approve release or open a dispute. An authorized verifier can resolve a dispute by releasing or refunding the escrow.
-- **Community-solar planning:** Project Owners can submit project and cost assumptions for review. Investors may register simulated interest, but the prototype does not accept investments, transfer money, or promise returns.
+- **Community-solar planning:** Any signed-in participant role can submit project and cost assumptions for independent review. Participants may register simulated interest and record simulated income allocations against the project's revenue-share agreement, but the prototype does not accept investments, verify real proceeds, transfer funds, or promise returns.
 - **Optional AI assistance:** With explicit consent, AI can provide preliminary evidence triage or a project-plan advisory. Its output is advisory only; it cannot verify delivery, approve evidence, or validate project costs.
 
 The platform records workflow information; it does not deliver electricity or prove that renewable energy was generated. Ethereum Sepolia escrow uses test ETH with no real-world value.
@@ -55,6 +55,8 @@ We kept matching rules deterministic so participants can understand why listings
 - We brought marketplace listings, matching, trade records, project planning, and evidence review into one coherent product experience.
 - We implemented a buyer-funded testnet escrow flow with evidence review and a dispute path, instead of treating seller evidence as a payment.
 - We made the participant terminology clearer and more professional: Energy Producer, Energy Consumer, Investor, and Project Owner.
+- We opened project creation to every participant role while retaining independent approval for authorized verifiers and admins.
+- We added a persistent simulated income-allocation record that follows project share terms without suggesting that money was paid.
 - We kept AI advisory and optional, with user consent required before sending relevant information for analysis.
 - We built a modular codebase with separate frontend, backend, and blockchain workspaces, plus automated backend and contract tests.
 - We documented important limitations so prototype records and testnet transactions are not mistaken for verified energy delivery or real investment activity.

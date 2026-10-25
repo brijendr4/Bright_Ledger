@@ -67,7 +67,7 @@ type Trade = {
 type EvidenceAiAnalysis = { summary: string; confidence: 'low' | 'medium' | 'high'; flags: string[]; suggestedChecks: string[] }
 type EvidenceAiReview = { id: string; fileSha256: string; model: string; analysis: EvidenceAiAnalysis }
 type Evidence = { id: string; project: string; source: string; quantity: number; interval: string; status: 'Pending' | 'Approved' | 'Rejected' | 'Disputed'; trade: string; evidenceHash: string; buyerCanReview: boolean; tradeStatus: string; reason?: string; reference?: string; evidenceFileSha256?: string; evidenceFileAvailable?: boolean; aiReview?: EvidenceAiReview | null }
-type Project = { id: string; name: string; location: string; area: number; target: number; raised: number; capacity: number; owner: string; ownerId?: string; status: string; image: string; siteType: string; permission: string; notes: string; estimateModel: string; fundingMethodology: string; estimateReviewSummary: string; estimateReviewConfidence: string; estimateLimitation: string }
+type Project = { id: string; name: string; location: string; area: number; target: number; raised: number; capacity: number; owner: string; ownerId?: string; status: string; image: string; siteType: string; permission: string; notes: string; estimateModel: string; fundingMethodology: string; estimateReviewSummary: string; estimateReviewConfidence: string; estimateLimitation: string; revenueShares: { owner: number; funder: number; community: number }; incomeDistributions: { id: string; amountMinor: number; source: string; createdAt: string; allocations: { recipient: string; type: string; amountMinor: number }[] }[] }
 type Contribution = { id: string; projectId: string; contributor: string; amount: number; time: string; status: string }
 type SolarWorkspaceData = {
   project: { id: string; siteId: string; name: string; owner: string; status: string; capacityKwp: number; fundingTargetMinor: number; fundingDeadline: string; agreementHash: string | null; allocationRules: { funderPct: number; ownerPct: number; operatorPct: number; reserveMinor: number; feeMinor: number; version: string } }
@@ -89,6 +89,7 @@ type ProjectFundingEstimateInput = {
   costs: { equipmentUsd: number; installationUsd: number; permittingUsd: number; interconnectionUsd: number; otherUsd: number }
   contingencyPercent: number
   revenueShares: { owner: number; funder: number; community: number }
+  consentToAi?: boolean
 }
 type ProjectFundingEstimate = {
   id: string
@@ -875,9 +876,33 @@ function App() {
   async function estimateProjectFunding(input: ProjectFundingEstimateInput) {
     const response = await apiPost<{ data: ProjectFundingEstimate }>('/api/projects/funding-estimates', {
       ...input,
-      consentToAi: true,
+      consentToAi: input.consentToAi ?? false,
     })
     return response.data
+  }
+
+  async function distributeProjectIncome(event: React.FormEvent<HTMLFormElement>, project: Project) {
+    event.preventDefault()
+    const formElement = event.currentTarget
+    const form = new FormData(formElement)
+    const amountUsd = Number(form.get('amountUsd'))
+    const source = String(form.get('source') ?? '').trim()
+    if (!Number.isFinite(amountUsd) || amountUsd <= 0 || source.length < 3) {
+      notify('Enter a positive simulated income amount and a source of at least 3 characters.')
+      return
+    }
+    try {
+      await apiPost(`/api/projects/${encodeURIComponent(project.id)}/income-distributions`, {
+        amountUsd,
+        source,
+        idempotencyKey: crypto.randomUUID(),
+      })
+      await refreshFromApi()
+      formElement.reset()
+      notify('Simulated income allocations recorded. No money was transferred.')
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Could not record simulated income allocations.')
+    }
   }
 
   async function reviewSolarProject(project: Project, decision: 'approve' | 'reject') {
@@ -1301,7 +1326,7 @@ function App() {
             <div className="heading-actions">
               <div className="role-switch"><span>Marketplace role</span><b>{role}</b></div>
               {(page === 'Overview' || page === 'My offers' || page === 'My requests') && <button className="button button-primary" data-tour-target={page === 'My offers' ? 'offer-form' : page === 'My requests' ? 'request-form' : undefined} onClick={() => setModal('listing')}><Plus size={17} /> Create listing</button>}
-              {page === 'Solar projects' && ['Project Owner', 'Admin'].includes(role) && <button className="button button-primary" onClick={() => setModal('project')}><Plus size={17} /> Create fundraiser</button>}
+              {page === 'Solar projects' && <button className="button button-primary" onClick={() => setModal('project')}><Plus size={17} /> Create fundraiser</button>}
               {page === 'Energy market' && <button className="button button-primary" onClick={() => setModal('listing')}><Plus size={17} /> Create listing</button>}
             </div>
           </div>
@@ -1313,7 +1338,7 @@ function App() {
           {page === 'Trades' && <Trades trades={filteredTrades} statusFilter={statusFilter} setStatusFilter={setStatusFilter} state={state} role={role} walletAddress={walletAddress} chainPaymentsEnabled={chainPaymentsEnabled} onSettle={settleTrade} onConfirm={confirmTrade} onCommit={commitTrade} onEvidence={(trade) => { setAiEvidenceReview(null); setSelectedTrade(trade); setSelectedEvidence(null); setModal('evidence') }} onReviewEvidence={(item) => { setAiEvidenceReview(null); setSelectedEvidence(item); setSelectedTrade(null); setModal('evidence') }} onCopy={copyText} />}
           {page === 'Evidence' && <EvidencePage evidence={state.evidence} role={role} onReview={(item) => { setAiEvidenceReview(null); setSelectedEvidence(item); setModal('evidence') }} onSelect={(item) => { setAiEvidenceReview(null); setSelectedEvidence(item); setModal('evidence') }} onDownload={(item) => { void downloadEvidenceFile(item) }} />}
           {page === 'Rewards' && <Rewards state={state} />}
-          {page === 'Solar projects' && <Projects projects={filteredProjects} contributions={state.contributions} filter={projectFilter} setFilter={setProjectFilter} onFund={(project) => { setSelectedProject(project); setModal('fund') }} onCreate={() => { if (['Project Owner', 'Admin'].includes(role)) setModal('project'); else notify('Project Owner access is assigned by the platform operator.') }} onOpen={setSolarWorkspaceId} workspaceId={solarWorkspaceId} onCloseWorkspace={() => setSolarWorkspaceId('')} role={role} identity={identity} mockApiEnabled={mockApiEnabled} onNotify={notify} onRefresh={refreshFromApi} />}
+          {page === 'Solar projects' && <Projects projects={filteredProjects} contributions={state.contributions} filter={projectFilter} setFilter={setProjectFilter} onFund={(project) => { setSelectedProject(project); setModal('fund') }} onCreate={() => setModal('project')} onDistributeIncome={distributeProjectIncome} onOpen={setSolarWorkspaceId} workspaceId={solarWorkspaceId} onCloseWorkspace={() => setSolarWorkspaceId('')} role={role} identity={identity} mockApiEnabled={mockApiEnabled} onNotify={notify} onRefresh={refreshFromApi} />}
           {page === 'Solar projects' && ['Verifier', 'Admin'].includes(role) && <SolarProjectReviewQueue projects={state.projects.filter((project) => project.status === 'Review')} onReview={(project, decision) => { void reviewSolarProject(project, decision) }} />}
           {page === 'Solar projects' && <SolarEstimateTransparency projects={filteredProjects} />}
           {page === 'Activity' && <ActivityPage activity={state.activity} onCopy={copyText} />}
@@ -1850,10 +1875,10 @@ function SolarProjectReviewQueue({ projects, onReview }: {
 
 function SolarEstimateTransparency({ projects }: { projects: Project[] }) {
   if (!projects.length) return null
-  return <section className="panel list-page-panel"><div className="panel-heading"><div><span className="section-kicker">ESTIMATE PROVENANCE</span><h2>Project costs & AI assessment</h2><p>Each published project includes a cost-based estimate and an advisory AI assessment.</p></div></div><div className="solar-record-list">{projects.map((project) => <div key={project.id}><span><b>{project.name} · {project.estimateReviewConfidence} confidence</b><small>{project.fundingMethodology} · assessed by {project.estimateModel}</small><small>{project.estimateReviewSummary}</small><small>{project.estimateLimitation}</small></span></div>)}</div></section>
+  return <section className="panel list-page-panel"><div className="panel-heading"><div><span className="section-kicker">ESTIMATE PROVENANCE</span><h2>Project cost estimates</h2><p>Cost estimates use submitter-provided assumptions; optional AI review is advisory.</p></div></div><div className="solar-record-list">{projects.map((project) => <div key={project.id}><span><b>{project.name} · {project.estimateReviewConfidence} confidence</b><small>{project.fundingMethodology} · {project.estimateModel === 'Not requested' ? 'AI review not requested' : `assessed by ${project.estimateModel}`}</small><small>{project.estimateReviewSummary}</small><small>{project.estimateLimitation}</small></span></div>)}</div></section>
 }
 
-function Projects({ projects, contributions, filter, setFilter, onFund, onCreate, onOpen, workspaceId, onCloseWorkspace, role, identity, mockApiEnabled, onNotify, onRefresh }: { projects: Project[]; contributions: Contribution[]; filter: string; setFilter: (value: string) => void; onFund: (project: Project) => void; onCreate: () => void; onOpen: (projectId: string) => void; workspaceId: string; onCloseWorkspace: () => void; role: Role; identity: string; mockApiEnabled: boolean; onNotify: (message: string) => void; onRefresh: () => Promise<void> }) {
+function Projects({ projects, contributions, filter, setFilter, onFund, onCreate, onDistributeIncome, onOpen, workspaceId, onCloseWorkspace, role, identity, mockApiEnabled, onNotify, onRefresh }: { projects: Project[]; contributions: Contribution[]; filter: string; setFilter: (value: string) => void; onFund: (project: Project) => void; onCreate: () => void; onDistributeIncome: (event: React.FormEvent<HTMLFormElement>, project: Project) => void; onOpen: (projectId: string) => void; workspaceId: string; onCloseWorkspace: () => void; role: Role; identity: string; mockApiEnabled: boolean; onNotify: (message: string) => void; onRefresh: () => Promise<void> }) {
   return <div className="page-stack">
     <section className="solar-intro">
       <div><span className="section-kicker">COMMUNITY SOLAR · FUNDRAISING</span><h2>Bring a solar project<br />to the community.</h2><p>Project Owners present a solar site and funding goal. Investors can register interest; all contributions shown here are simulated and no money is transferred.</p><button className="button button-primary" data-tour-target="projects" onClick={onCreate}><Plus size={16} /> Create a fundraiser</button></div>
@@ -1861,7 +1886,7 @@ function Projects({ projects, contributions, filter, setFilter, onFund, onCreate
     </section>
     <div className="solar-toolbar"><div><b>Community solar projects</b><span> · {projects.length} opportunities</span></div><div className="filter-select-wrap"><Filter size={14} /><select aria-label="Filter solar projects" value={filter} onChange={(event) => setFilter(event.target.value)}><option>All projects</option><option>Funding</option><option>Operational</option><option>Review</option></select><ChevronDown size={13} /></div></div>
     {projects.length === 0
-      ? <div className="empty-state"><Sun size={26} /><h3>No projects found</h3><p>Projects appear after a Project Owner submits a cost-based funding estimate and project details for review.</p></div>
+      ? <div className="empty-state"><Sun size={26} /><h3>No projects found</h3><p>Submit a project with cost assumptions for independent review. Any participant role can propose a project.</p></div>
       : <div className="project-grid">{projects.map((project, index) => <article className="project-card" key={project.id}>
         <div className={`project-cover ${project.image}`}><img src={`/images/${['rooftop.jpg', 'rooftop_3.jpg', 'solarfield.jpg'][index % 3]}`} alt={`${project.name} solar project site`} /><span className="project-id">{project.id}</span><span className="project-cover-tag">COMMUNITY SOLAR</span></div>
         <div className="project-card-body"><div className="project-location"><span><Sun size={13} /> {project.location}</span><Status status={project.status} /></div>
@@ -1870,6 +1895,19 @@ function Projects({ projects, contributions, filter, setFilter, onFund, onCreate
           <div className="funding-progress-head"><span>Your recorded interests · {contributions.filter((item) => item.projectId === project.id).length}</span><b>{pct(project.raised, project.target)}%</b></div><div className="progress-track"><i style={{ width: `${pct(project.raised, project.target)}%` }} /></div>
           <div className="funding-amount"><span>{formatUSD(project.raised)} <small>contributed</small></span><span>{formatUSD(project.target - project.raised)} <small>remaining</small></span></div>
           <button className="button button-secondary project-action" disabled={project.status !== 'Funding'} onClick={() => onFund(project)}>{project.status === 'Review' || project.status === 'Draft' ? 'Awaiting project approval' : project.raised >= project.target ? 'Funding goal reached' : project.status === 'Funding' ? 'Register investor interest' : 'Funding unavailable'} <ArrowRight size={15} /></button>
+          {['Funding', 'Operational'].includes(project.status) && <details className="project-income-panel">
+            <summary>Record simulated income & allocate</summary>
+            <p>Enter a prototype income amount. Bright Ledger allocates it by the project agreement and records the result; it does not collect or pay money.</p>
+            <form className="solar-inline-form" onSubmit={(event) => onDistributeIncome(event, project)}>
+              <label>Simulated income (USD)<input name="amountUsd" type="number" min="0.01" max="100000000" step="0.01" required /></label>
+              <label>Income source<input name="source" minLength={3} maxLength={200} placeholder="Example: simulated monthly energy proceeds" required /></label>
+              <button className="button button-secondary" type="submit">Allocate by project shares</button>
+            </form>
+            {project.incomeDistributions.length > 0 && <div className="project-income-records">{project.incomeDistributions.map((record) => <div key={record.id}>
+              <b>{record.id} · {formatUSD(record.amountMinor / 100)}</b><small>{record.source} · {new Date(record.createdAt).toLocaleString()}</small>
+              {record.allocations.map((allocation, index) => <small key={`${record.id}-${index}`}>{allocation.type} · {allocation.recipient}: {formatUSD(allocation.amountMinor / 100)}</small>)}
+            </div>)}</div>}
+          </details>}
           {mockApiEnabled && <button className="button button-outline project-action" onClick={() => onOpen(project.id)}>Open project workspace <ArrowRight size={15} /></button>}
         </div>
       </article>)}</div>}
@@ -2026,10 +2064,7 @@ function Modal({ kind, onClose, onListing, onProject, onEstimateProject, onMatch
     const form = event.currentTarget.form
     if (!form) return
     const consent = form.elements.namedItem('fundingAiConsent')
-    if (!(consent instanceof HTMLInputElement) || !consent.checked) {
-      setFundingEstimateError('Confirm consent before sending the approximate location, site type, area, costs and proposed revenue shares to the AI provider.')
-      return
-    }
+    const consentToAi = consent instanceof HTMLInputElement && consent.checked
     const values = new FormData(form)
     const input: ProjectFundingEstimateInput = {
       location: String(values.get('location') ?? ''),
@@ -2048,6 +2083,7 @@ function Modal({ kind, onClose, onListing, onProject, onEstimateProject, onMatch
         funder: Number(values.get('funderShare')),
         community: Number(values.get('communityShare')),
       },
+      consentToAi,
     }
     setFundingEstimateBusy(true)
     setFundingEstimateError('')
@@ -2094,13 +2130,13 @@ function Modal({ kind, onClose, onListing, onProject, onEstimateProject, onMatch
       <div className="form-row revenue-share-inputs"><label>Project Owner share<input name="ownerShare" type="number" min="0" max="100" step="1" placeholder="%" required /></label><label>Investor share<input name="funderShare" type="number" min="0" max="100" step="1" placeholder="%" required /></label><label>Community share<input name="communityShare" type="number" min="0" max="100" step="1" placeholder="%" required /></label></div>
       <label>Permission status<select name="permission"><option>Owner permission stated</option><option>Permission pending review</option><option>Shared community space</option></select></label>
       <label>Site notes<textarea name="notes" rows={2} placeholder="Optional non-sensitive context." /></label>
-      <label className="ai-consent"><input name="fundingAiConsent" type="checkbox" /> I consent to sending the approximate location, site type, area, cost inputs and proposed revenue shares to OpenRouter for an advisory project assessment. Do not include personal or confidential data.</label>
+      <label className="ai-consent"><input name="fundingAiConsent" type="checkbox" /> Optional: send the approximate location, site type, area, cost inputs and proposed revenue shares to OpenRouter for an advisory AI assessment. If unchecked, only the cost estimate is calculated and the project is still sent for human review. Do not include personal or confidential data.</label>
       <input type="hidden" name="fundingEstimateId" />
-      <button type="button" className="button button-secondary" onClick={(event) => { void requestProjectEstimate(event) }} disabled={fundingEstimateBusy}>{fundingEstimateBusy ? 'Assessing project…' : 'Calculate funding & assess project'} <TrendingUp size={15} /></button>
+      <button type="button" className="button button-secondary" onClick={(event) => { void requestProjectEstimate(event) }} disabled={fundingEstimateBusy}>{fundingEstimateBusy ? 'Calculating project estimate…' : 'Calculate funding estimate'} <TrendingUp size={15} /></button>
       {fundingEstimateError && <p className="funding-estimate-error" role="alert">{fundingEstimateError}</p>}
       {fundingEstimate && <div className="funding-estimate-result" role="status"><div className="funding-estimate-total"><span>Required funding from your cost inputs</span><b>{formatUSD(fundingEstimate.requiredFundingUsd)}</b><small>Capacity estimate: {fundingEstimate.capacityKwp} kWp · user-entered cost basis · not a supplier quote</small></div>
         <ul>{fundingEstimate.costBreakdown.map((item) => <li key={item.category}><span>{item.category}</span><b>{formatUSD(item.amountMinor / 100)}</b></li>)}<li><span>Contingency</span><b>{formatUSD(fundingEstimate.contingencyMinor / 100)}</b></li></ul>
-        <p><b>AI project assessment · {fundingEstimate.aiReview.confidence} confidence · advisory only</b><br />{fundingEstimate.aiReview.summary}</p>
+        <p><b>{fundingEstimate.aiReview.model === 'Not requested' ? 'Human review note' : `AI project assessment · ${fundingEstimate.aiReview.confidence} confidence · advisory only`}</b><br />{fundingEstimate.aiReview.summary}</p>
         {fundingEstimate.aiReview.flags.length > 0 && <div><b>Assumptions to check</b><ul>{fundingEstimate.aiReview.flags.map((item) => <li key={item}>{item}</li>)}</ul></div>}
         {fundingEstimate.aiReview.suggestedChecks.length > 0 && <div><b>Suggested verification</b><ul>{fundingEstimate.aiReview.suggestedChecks.map((item) => <li key={item}>{item}</li>)}</ul></div>}
         <div className="funding-share-suggestion"><span>AI-proposed revenue allocation · advisory only</span><b>Project Owner {fundingEstimate.aiReview.suggestedRevenueShares.owner}% · Investor {fundingEstimate.aiReview.suggestedRevenueShares.funder}% · Community {fundingEstimate.aiReview.suggestedRevenueShares.community}%</b><button type="button" className="text-link" onClick={(event) => { const form = event.currentTarget.form; if (!form) return; const shares = fundingEstimate.aiReview.suggestedRevenueShares; for (const [name, value] of Object.entries({ ownerShare: shares.owner, funderShare: shares.funder, communityShare: shares.community })) { const field = form.elements.namedItem(name); if (field instanceof HTMLInputElement) field.value = String(value) } }}>Apply suggested allocation</button></div>
