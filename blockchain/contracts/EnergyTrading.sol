@@ -14,7 +14,7 @@ interface IPriceFeed {
 
 /// @notice Records trade commitments and optionally escrows native testnet ETH.
 contract EnergyTrading {
-    enum Status { None, Committed, EvidenceSubmitted, EvidenceApproved, Disputed, Settled }
+    enum Status { None, Committed, EvidenceSubmitted, EvidenceApproved, Disputed, Settled, Refunded }
 
     struct Trade {
         address buyer;
@@ -115,6 +115,48 @@ contract EnergyTrading {
         emit EvidenceSubmitted(tradeId, evidenceHash);
     }
 
+    function approveEvidenceAndSettle(bytes32 tradeId, bytes32 evidenceHash) external {
+        Trade storage trade = trades[tradeId];
+        if (trade.status != Status.Committed || msg.sender != trade.buyer || evidenceHash == bytes32(0)) {
+            revert Unauthorized();
+        }
+        trade.evidenceHash = evidenceHash;
+        emit EvidenceSubmitted(tradeId, evidenceHash);
+        trade.status = Status.EvidenceApproved;
+        emit EvidenceReviewed(tradeId, true, bytes32(0));
+        _settle(tradeId, trade);
+    }
+
+    function raiseDispute(bytes32 tradeId, bytes32 evidenceHash, bytes32 reasonHash) external {
+        Trade storage trade = trades[tradeId];
+        if (trade.status != Status.Committed || msg.sender != trade.buyer || evidenceHash == bytes32(0)) {
+            revert Unauthorized();
+        }
+        trade.evidenceHash = evidenceHash;
+        trade.status = Status.Disputed;
+        emit EvidenceSubmitted(tradeId, evidenceHash);
+        emit EvidenceReviewed(tradeId, false, reasonHash);
+    }
+
+    function resolveDispute(bytes32 tradeId, bool approved, bytes32 reasonHash) external {
+        Trade storage trade = trades[tradeId];
+        if (!verifiers[msg.sender] || trade.status != Status.Disputed) revert Unauthorized();
+        emit EvidenceReviewed(tradeId, approved, reasonHash);
+        if (approved) {
+            trade.status = Status.EvidenceApproved;
+            _settle(tradeId, trade);
+            return;
+        }
+        trade.status = Status.Refunded;
+        uint256 refundWei = escrowedWei[tradeId];
+        if (refundWei > 0) {
+            escrowedWei[tradeId] = 0;
+            (bool refunded,) = payable(trade.buyer).call{value: refundWei}('');
+            if (!refunded) revert PaymentTransferFailed();
+            emit TradePaymentRefunded(tradeId, trade.buyer, refundWei);
+        }
+    }
+
     function reviewEvidence(bytes32 tradeId, bool approved, bytes32 reasonHash) external {
         Trade storage trade = trades[tradeId];
         if (!verifiers[msg.sender]) revert Unauthorized();
@@ -137,6 +179,10 @@ contract EnergyTrading {
         Trade storage trade = trades[tradeId];
         if (trade.status != Status.EvidenceApproved) revert InvalidState();
         if (msg.sender != trade.buyer && msg.sender != trade.seller) revert Unauthorized();
+        _settle(tradeId, trade);
+    }
+
+    function _settle(bytes32 tradeId, Trade storage trade) private {
         trade.status = Status.Settled;
         uint256 points = uint256(trade.energyWh) / 100;
         if (points == 0) points = 1;

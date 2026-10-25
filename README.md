@@ -2,7 +2,7 @@
 
 # Bright Ledger
 
-### Local clean energy, made visible.
+### The Future of Energy
 
 An extensible peer-to-peer energy marketplace for coordinating renewable-energy offers, buyer requests, and auditable trade records.
 
@@ -31,11 +31,12 @@ The implementation adapts ideas from the research paper [“BPET: A Unified Bloc
 - **Energy marketplace:** publish offers and buy requests with a quantity, USD/kWh price, service area, renewable source, and delivery window.
 - **Global locations:** sample marketplace and solar-project records cover capital cities across Asia and Africa, alongside projects in Türkiye, the United Kingdom, and the United States. Participants can enter their own city and country when listing energy or a site.
 - **Rule-based matching:** check service area, available quantity, price limits, and delivery-window overlap.
-- **Trade lifecycle:** record proposals, participant confirmations, evidence submissions, independent review, disputes, and settlement eligibility.
-- **Testnet trade escrow:** on Ethereum Sepolia, the buyer can approve an ETH/USD-feed-priced native SepoliaETH escrow in their wallet; a verifier rejection refunds it, and an approved trade releases it to the seller on settlement. The backend verifies contract receipts and never holds user keys or funds. SepoliaETH and this payment flow are test-only.
+- **Trade lifecycle:** both participants confirm the terms; the buyer funds escrow; the seller submits delivery evidence; the buyer approves release or opens a dispute; an operator-authorized verifier resolves disputes.
+- **Testnet trade escrow:** on Ethereum Sepolia, only the buyer funds the ETH/USD-feed-priced native SepoliaETH escrow. Buyer approval releases it to the seller; opening a dispute keeps it locked until an authorized verifier releases it or refunds the buyer. The backend verifies contract receipts and never holds user keys or funds. SepoliaETH and this payment flow are test-only.
 - **Wallet network awareness:** the workspace displays the connected wallet's EVM network and chain ID. Contract actions are limited to the chain configured for that backend deployment; switching a wallet to Ethereum or Polygon does not deploy a contract or configure an RPC. XRP Ledger needs a separate integration and is not supported by the current EVM transaction flow.
 - **Market-price context:** optionally display a U.S. EIA monthly retail-price reference. It is a contextual benchmark—not a real-time wholesale or local settlement price.
-- **Community-solar planning:** enter site and cost assumptions, calculate a funding target, and request a consent-gated AI advisory before submitting a project for human review. Community interest is recorded only as a non-cash pledge; this prototype does not accept investments, transfer funds, or pay returns.
+- **Community-solar fundraising:** a Project Owner submits site and cost assumptions, calculates a funding goal, and requests a consent-gated AI project assessment before human review. Investor interest is a simulated, non-cash record; this prototype does not accept investments, transfer funds, or pay returns.
+- **Professional participant terms:** Energy Producers offer generated energy; Energy Consumers request or purchase it. A Project Owner (fundraiser) submits a community-solar project, and Investors can register simulated, non-cash interest. These investor records are not real investments or funding commitments.
 - **Extensible workspace:** frontend, backend, and blockchain code are separated into npm workspaces for independent development and deployment.
 
 ### Climate impact and responsible claims
@@ -46,14 +47,14 @@ Bright Ledger is intended to support renewable-energy visibility and community c
 
 The marketplace uses **deterministic, explainable matching rules**. Optional, consent-gated AI provides a preliminary evidence triage and a solar funding-plan review. Evidence files (JPEG, PNG, WebP, PDF, or UTF-8 CSV; 8 MB maximum) are stored with their SHA-256 digest in PostgreSQL so authorized trade participants and verifiers can retrieve them. A file is sent to OpenRouter only when the user explicitly requests an AI check and gives consent; users should review the provider's current data policies before uploading anything sensitive.
 
-For solar planning, the funding amount is calculated from user-entered USD line items plus a contingency, not generated or market-verified by AI. AI can offer a non-binding review and proposed revenue split; users must review and select project terms themselves. AI output is untrusted and advisory: it cannot authenticate a meter, prove generation or delivery, approve evidence, validate project costs, or provide investment advice. Human verifier permissions and the existing review workflow remain mandatory. The selected model and PDF parsing options may have availability, rate, or provider-policy limits; configure a private OpenRouter key on the backend to enable AI features.
+For solar planning, the funding amount is calculated from user-entered USD line items plus a contingency, not generated or market-verified by AI. AI can offer a non-binding review and proposed revenue split; users must review and select project terms themselves. AI output is untrusted and advisory: it cannot authenticate a meter, prove generation or delivery, approve evidence, validate project costs, or provide investment advice. The trade buyer reviews delivery evidence; operator-authorized verifiers resolve disputes. The selected model and PDF parsing options may have availability, rate, or provider-policy limits; configure a private OpenRouter key on the backend to enable AI features.
 
 ## How it works
 
 ```mermaid
 flowchart LR
-  Seller[Prosumer wallet] --> UI[React web app]
-  Buyer[Consumer wallet] --> UI
+  Producer[Energy Producer wallet] --> UI[React web app]
+  Consumer[Energy Consumer wallet] --> UI
   UI -->|JSON API and signed challenge| API[Express API]
   API --> DB[(PostgreSQL)]
   API -->|validate selected transactions| EVM[Local EVM or configured EVM network]
@@ -62,11 +63,11 @@ flowchart LR
 ```
 
 1. A participant connects a wallet and signs a one-time account challenge.
-2. A prosumer publishes an offer or a consumer publishes a request.
+2. An Energy Producer publishes an offer or an Energy Consumer publishes a request.
 3. The marketplace filters listings; the API applies the compatibility rules when a trade is proposed.
-4. Trade participants confirm the proposal. The seller can submit delivery evidence.
-5. On Ethereum Sepolia, the buyer's wallet escrows the quoted SepoliaETH amount when committing the trade; the browser shows both the agreed USD total and ETH amount before MetaMask asks for approval.
-6. A separate authorized verifier reviews evidence. Rejection refunds escrow; approval lets a trade participant submit the settlement transaction that releases escrow to the seller.
+4. Both participants confirm the agreed terms. If Sepolia escrow is configured, only the buyer funds it; evidence submission is not a payment.
+5. The seller submits delivery evidence. The buyer checks the record and either approves it to release escrow to the seller or opens a dispute, which leaves escrow locked.
+6. An operator-authorized verifier resolves an open dispute by releasing escrow to the seller or refunding it to the buyer.
 7. The API checks the configured contract's transaction receipts and event data before accepting chain-backed transitions. It does not custody funds or submit transactions for users.
 
 ## Quickstart
@@ -140,15 +141,15 @@ npm run chain:test
 npm run chain:deploy:sepolia
 ```
 
-The deploy command prints the contract address and uses the Sepolia ETH/USD Chainlink feed. Set that address, `CHAIN_ID=11155111`, and `CHAIN_RPC_URL` to the same Sepolia RPC in the backend's server-side environment, then redeploy the backend and connect the buyer's wallet to Ethereum Sepolia. For an on-chain evidence review, use the deployer/contract-owner wallet as a verifier or have that owner enable the verifier with `setVerifier`. The corresponding verifier wallet must also be authorized in the backend's `VERIFIER_WALLET_ADDRESSES`. The deployer key stays local and is not needed by the running app. Base Sepolia remains available as record-only with `BASE_SEPOLIA_RPC_URL` (or `BASE_SEPOLIA_ALCHEMY_API_KEY`) and `npm run deploy:base-sepolia --workspace @bright-ledger/blockchain`.
+The deploy command prints the contract address and uses the Sepolia ETH/USD Chainlink feed. Set that address, `CHAIN_ID=11155111`, and `CHAIN_RPC_URL` to the same Sepolia RPC in the backend's server-side environment, then redeploy the backend and connect the buyer's wallet to Ethereum Sepolia. The updated buyer-approval and dispute-resolution methods require a new contract deployment; update `CONTRACT_ADDRESS` only after any in-flight escrow on the old contract has been completed or resolved. Configure dispute verifiers both in the contract (`setVerifier`) and in the backend's `VERIFIER_WALLET_ADDRESSES`. The deployer key stays local and is not needed by the running app. Base Sepolia remains available as record-only with `BASE_SEPOLIA_RPC_URL` (or `BASE_SEPOLIA_ALCHEMY_API_KEY`) and `npm run deploy:base-sepolia --workspace @bright-ledger/blockchain`.
 
 ### Try the marketplace
 
-1. Create a wallet profile with the **Prosumer** role.
+1. Create a wallet profile with the **Energy Producer** role.
 2. Open **Energy market → Create listing**, publish an **Offer**, and enter its quantity, USD/kWh price, service area, renewable source, and delivery window.
-3. Use a different wallet to create a **Consumer** profile.
+3. Use a different wallet to create an **Energy Consumer** profile.
 4. In the buyer account, select the offer and request a match. The resulting trade appears under **Trades**.
-5. Follow the confirmation and evidence workflow. Sellers can optionally attach a meter file and request an AI triage report; a human verifier still reviews the record. Settlement remains gated on required confirmations and evidence review.
+5. Both parties confirm the terms. The buyer funds the Sepolia escrow, then the seller submits delivery evidence (optionally with a meter file and consented AI triage). The buyer approves to release escrow or opens a dispute for verifier resolution.
 
 On Ethereum Sepolia, the buyer can escrow the quoted SepoliaETH amount and the contract releases or refunds it according to evidence review. Test ETH has no real-world value. The transaction does not deliver electricity, and separate participants are needed to match one another's listings.
 
@@ -175,7 +176,7 @@ bright-ledger/
 | Evidence triage | OpenRouter multimodal API (optional, advisory only) |
 | External reference | Optional EIA monthly U.S. retail electricity-price API |
 | Local orchestration | Docker Compose |
-| Hosting configuration | SmarterASP.NET (manual deployment; no provider-specific manifest) |
+| Hosting configuration | Render (API), Vercel (frontend), Neon (PostgreSQL) |
 
 ### Scale and extension
 
@@ -210,17 +211,16 @@ Use short-lived feature branches and pull requests; keep `main` deployable and a
 
 ## Deployment
 
-- **Hosting target:** [`render.yaml`](render.yaml) defines separate Render services for the Vite static frontend, Express Node.js API, and PostgreSQL database. The frontend and API are built from the repository root so npm workspaces use the root lockfile. The blockchain is a deployed Sepolia contract, not a server process to start.
-- **Render environment setup:** when creating the Blueprint, set `VITE_API_BASE_URL` to the API's HTTPS origin, and set `API_ORIGIN` and `AUTH_URI` to the frontend's HTTPS origin. Configure `CHAIN_RPC_URL`, `CHAIN_ID`, and `CONTRACT_ADDRESS` for the selected deployed network. The blueprint creates a free PostgreSQL database; review Render's free-service limits and database retention before using it for persistent data.
-- **Other hosting:** verify that the selected plan supports the backend's Node.js `>=22.12.0` runtime, a continuously running Express service, and connectivity to a PostgreSQL database. For SmarterASP.NET, confirm the available database options, HTTPS domains, and resource/usage limits; the app requires PostgreSQL.
+- **Hosting target:** [`render.yaml`](render.yaml) defines the Render Docker API service. The Vite frontend is deployed separately on Vercel, and the API uses the Neon PostgreSQL database; neither the frontend nor database is provisioned by the Render Blueprint. The blockchain is a deployed Sepolia contract, not a server process to start.
+- **Hosting environment setup:** set `DATABASE_URL` to the Neon connection string and `DATABASE_SSL=true` on Render. Set Render's `API_ORIGIN` and `AUTH_URI` to the Vercel frontend's HTTPS origin. Set Vercel's `VITE_API_BASE_URL` to the Render API's HTTPS origin and redeploy Vercel after changing it. Configure `CHAIN_RPC_URL`, `CHAIN_ID`, and `CONTRACT_ADDRESS` for the selected deployed network.
 - **Build:** from the repository root run `npm run build`; this builds the frontend and backend and compiles the Solidity contract. Run `npm run chain:test` to validate contract behavior.
 - **Frontend:** build with `npm run build:frontend` and publish `frontend/dist`. Set `VITE_API_BASE_URL` to the deployed API's HTTPS origin before building.
 - **Backend:** build and start the standalone `backend/` package with `npm run build` and `npm start` from `backend/`. Configure `DATABASE_URL`, the frontend `API_ORIGIN`, the deployed frontend `AUTH_URI`, the public wallet-signing `AUTH_DOMAIN`, and the `CHAIN_ID`. Add only operator-controlled wallet addresses to `ADMIN_WALLET_ADDRESSES`, `VERIFIER_WALLET_ADDRESSES`, and `SPACE_OWNER_WALLET_ADDRESSES`. Sessions are database-backed; no JWT signing secret is used.
 - **AI evidence triage:** set `OPENROUTER_API_KEY` and (optionally) `OPENROUTER_MODEL` in the backend host's secret/environment settings. Never expose the key as a `VITE_*` variable. Without a key, the rest of the app works and the API returns a clear AI-not-configured response.
 - **Solar funding review:** the backend calculates USD funding needs from submitted cost categories and contingency, persists the plan, and may request a consented AI advisory and revenue-share proposal. The cost inputs are not independently verified; the AI cannot set or validate the total.
 - **Database:** use a managed PostgreSQL service for hosted environments; account for its connection limits, backups, TLS requirements, and availability characteristics.
-- **Blockchain deployment:** deploy once from a trusted local machine or CI runner with `npm run chain:deploy:sepolia`. The deployment key stays in local `blockchain/.env`; never put it on SmarterASP.NET or in the browser. Configure the backend with `CHAIN_RPC_URL=https://ethereum-sepolia-rpc.publicnode.com`, `CHAIN_ID=11155111`, and the printed `CONTRACT_ADDRESS`. The backend connects to the contract through the Sepolia RPC; no `npm start` process is needed for the blockchain workspace.
-- **Trade payments:** the buyer approves the exact contract quote in MetaMask. The Sepolia ETH/USD Chainlink feed is used by the contract to calculate the USD listing total in native SepoliaETH; the contract escrow refunds on rejected evidence and releases payment on settlement. MetaMask does not convert a USD invoice automatically. The browser presents the quote, and the buyer pays network gas separately. This is a testnet prototype, not a production payment system.
+- **Blockchain deployment:** deploy once from a trusted local machine or CI runner with `npm run chain:deploy:sepolia`. The deployment key stays in local `blockchain/.env`; never put it on Render, Vercel, or in the browser. Configure the backend with `CHAIN_RPC_URL=https://ethereum-sepolia-rpc.publicnode.com`, `CHAIN_ID=11155111`, and the printed `CONTRACT_ADDRESS`. The backend connects to the contract through the Sepolia RPC; no `npm start` process is needed for the blockchain workspace.
+- **Trade payments:** only the buyer approves the exact contract quote in MetaMask. The Sepolia ETH/USD Chainlink feed is used by the contract to calculate the agreed USD total in native SepoliaETH. The buyer's approval of seller evidence releases escrow; a buyer dispute keeps escrow locked until a verifier decides to release or refund it. MetaMask does not convert a USD invoice automatically. The browser presents the quote, and the buyer pays network gas separately. This is a testnet prototype, not a production payment system.
 
 Never commit `.env` files, private keys, API keys, or production credentials. Do not put secrets in `VITE_*` variables.
 

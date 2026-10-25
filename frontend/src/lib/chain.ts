@@ -6,8 +6,10 @@ type ChainConfig = { chain: { enabled: boolean; paymentsEnabled: boolean; chainI
 const abi = [
   'function quotePayment(uint64 energyWh,uint128 pricePerKWhScaled) view returns (uint256 paymentWei,uint256 ethUsdPrice)',
   'function commitTrade(bytes32 tradeId,address buyer,address seller,uint64 energyWh,uint128 pricePerKWhScaled) payable',
-  'function submitEvidence(bytes32 tradeId,bytes32 evidenceHash)',
   'function reviewEvidence(bytes32 tradeId,bool approved,bytes32 reasonHash)',
+  'function approveEvidenceAndSettle(bytes32 tradeId,bytes32 evidenceHash)',
+  'function raiseDispute(bytes32 tradeId,bytes32 evidenceHash,bytes32 reasonHash)',
+  'function resolveDispute(bytes32 tradeId,bool approved,bytes32 reasonHash)',
   'function settleTrade(bytes32 tradeId)',
 ]
 
@@ -78,35 +80,19 @@ export async function commitTradeOnChain(trade: {
   ], paymentWei === undefined ? undefined : { value: paymentWei })
 }
 
-export async function makeEvidenceHash(input: {
-  tradeId: string
-  quantity: number
-  source: string
-  intervalStart: string
-  intervalEnd: string
-  reference: string
-  evidenceFileSha256?: string
-}): Promise<string> {
-  const { keccak256, toUtf8Bytes } = await import('ethers')
-  return keccak256(toUtf8Bytes(JSON.stringify({
-    tradeId: input.tradeId,
-    quantity: input.quantity,
-    source: input.source,
-    intervalStart: input.intervalStart,
-    intervalEnd: input.intervalEnd,
-    reference: input.reference,
-    ...(input.evidenceFileSha256 ? { evidenceFileSha256: input.evidenceFileSha256 } : {}),
-  })))
-}
-
-export async function submitEvidenceOnChain(tradeId: string, evidenceHash: string) {
+export async function approveEvidenceOnChain(tradeId: string, evidenceHash: string) {
   const { id } = await import('ethers')
-  return sendContract('submitEvidence', [id(tradeId), evidenceHash])
+  return sendContract('approveEvidenceAndSettle', [id(tradeId), evidenceHash])
 }
 
-export async function reviewEvidenceOnChain(tradeId: string, approved: boolean, reason: string) {
+export async function raiseDisputeOnChain(tradeId: string, evidenceHash: string, reason: string) {
   const { id, keccak256, toUtf8Bytes } = await import('ethers')
-  return sendContract('reviewEvidence', [id(tradeId), approved, keccak256(toUtf8Bytes(reason))])
+  return sendContract('raiseDispute', [id(tradeId), evidenceHash, keccak256(toUtf8Bytes(reason))])
+}
+
+export async function resolveDisputeOnChain(tradeId: string, approved: boolean, reason: string) {
+  const { id, keccak256, toUtf8Bytes } = await import('ethers')
+  return sendContract('resolveDispute', [id(tradeId), approved, keccak256(toUtf8Bytes(reason))])
 }
 
 export async function settleTradeOnChain(tradeId: string) {

@@ -17,7 +17,7 @@ describe('EnergyTrading', function () {
     await assert.rejects(contract.connect(seller).commitTrade(...args))
   })
 
-  it('requires seller evidence, independent verifier approval, then permits one settlement', async function () {
+  it('retains the legacy evidence-review path for existing contract integrations', async function () {
     const { ethers } = await network.connect()
     const [owner, buyer, seller, verifier, outsider] = await ethers.getSigners()
     const feed = await ethers.deployContract('MockETHUSDFeed', [2000_00000000n])
@@ -47,6 +47,69 @@ describe('EnergyTrading', function () {
     assert.equal(await contract.demoPoints(buyer.address), 80n)
     assert.equal(await contract.demoPoints(seller.address), 80n)
     await assert.rejects(contract.connect(seller).settleTrade(tradeId))
+  })
+
+  it('lets the buyer approve delivery and release escrow without a seller payment transaction', async function () {
+    const { ethers } = await network.connect()
+    const [owner, buyer, seller] = await ethers.getSigners()
+    const feed = await ethers.deployContract('MockETHUSDFeed', [2000_00000000n])
+    const contract = await ethers.deployContract('EnergyTrading', [owner.address, await feed.getAddress()])
+    const tradeId = ethers.id('trade-buyer-approval')
+    const evidenceHash = ethers.id('delivery-evidence')
+    const [paymentWei] = await contract.quotePayment(8_000n, 49_000n)
+    await contract.connect(buyer).commitTrade(tradeId, buyer.address, seller.address, 8_000n, 49_000n, { value: paymentWei })
+
+    await assert.rejects(contract.connect(seller).approveEvidenceAndSettle(tradeId, evidenceHash))
+    const sellerBalanceBefore = await ethers.provider.getBalance(seller.address)
+    await contract.connect(buyer).approveEvidenceAndSettle(tradeId, evidenceHash)
+
+    const settled = await contract.getTrade(tradeId)
+    assert.equal(settled.status, 5n)
+    assert.equal(settled.evidenceHash, evidenceHash)
+    assert.equal((await ethers.provider.getBalance(seller.address)) - sellerBalanceBefore, paymentWei)
+    assert.equal(await contract.escrowedWei(tradeId), 0n)
+  })
+
+  it('keeps escrow locked during a buyer dispute and lets an operator resolve it', async function () {
+    const { ethers } = await network.connect()
+    const [owner, buyer, seller, verifier, outsider] = await ethers.getSigners()
+    const feed = await ethers.deployContract('MockETHUSDFeed', [2000_00000000n])
+    const contract = await ethers.deployContract('EnergyTrading', [owner.address, await feed.getAddress()])
+    const tradeId = ethers.id('trade-dispute-resolution')
+    const evidenceHash = ethers.id('disputed-delivery')
+    const [paymentWei] = await contract.quotePayment(8_000n, 49_000n)
+    await contract.setVerifier(verifier.address, true)
+    await contract.connect(buyer).commitTrade(tradeId, buyer.address, seller.address, 8_000n, 49_000n, { value: paymentWei })
+
+    await contract.connect(buyer).raiseDispute(tradeId, evidenceHash, ethers.id('buyer-reason'))
+    assert.equal((await contract.getTrade(tradeId)).status, 4n)
+    assert.equal(await contract.escrowedWei(tradeId), paymentWei)
+    await assert.rejects(contract.connect(outsider).resolveDispute(tradeId, true, ethers.ZeroHash))
+
+    const sellerBalanceBefore = await ethers.provider.getBalance(seller.address)
+    await contract.connect(verifier).resolveDispute(tradeId, true, ethers.ZeroHash)
+    assert.equal((await contract.getTrade(tradeId)).status, 5n)
+    assert.equal((await ethers.provider.getBalance(seller.address)) - sellerBalanceBefore, paymentWei)
+    assert.equal(await contract.escrowedWei(tradeId), 0n)
+  })
+
+  it('refunds escrow to the buyer when the verifier resolves the dispute for them', async function () {
+    const { ethers } = await network.connect()
+    const [owner, buyer, seller, verifier] = await ethers.getSigners()
+    const feed = await ethers.deployContract('MockETHUSDFeed', [2000_00000000n])
+    const contract = await ethers.deployContract('EnergyTrading', [owner.address, await feed.getAddress()])
+    const tradeId = ethers.id('trade-dispute-refund')
+    const [paymentWei] = await contract.quotePayment(8_000n, 49_000n)
+    await contract.setVerifier(verifier.address, true)
+    await contract.connect(buyer).commitTrade(tradeId, buyer.address, seller.address, 8_000n, 49_000n, { value: paymentWei })
+    await contract.connect(buyer).raiseDispute(tradeId, ethers.id('disputed-delivery'), ethers.id('buyer-reason'))
+    const buyerBalanceBefore = await ethers.provider.getBalance(buyer.address)
+
+    await contract.connect(verifier).resolveDispute(tradeId, false, ethers.id('refund-reason'))
+
+    assert.equal((await contract.getTrade(tradeId)).status, 6n)
+    assert.equal((await ethers.provider.getBalance(buyer.address)) - buyerBalanceBefore, paymentWei)
+    assert.equal(await contract.escrowedWei(tradeId), 0n)
   })
 
   it('refunds the buyer when a verifier rejects evidence', async function () {

@@ -1,30 +1,19 @@
 version: "1"
 
-databases:
-  - name: bright-ledger-db
-    databaseName: bright_ledger
-    user: bright_ledger
-    plan: free
-    region: oregon
-
 services:
   - type: web
     name: bright-ledger-api
-    runtime: node
+    runtime: docker
     plan: free
     region: oregon
-    buildCommand: npm ci && npm run build:backend
-    startCommand: npm run start:backend
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
     healthCheckPath: /api/health
     envVars:
-      - key: NODE_VERSION
-        value: 22.12.0
       - key: DATABASE_URL
-        fromDatabase:
-          name: bright-ledger-db
-          property: connectionString
+        sync: false
       - key: DATABASE_SSL
-        value: "false"
+        value: "true"
       - key: API_ORIGIN
         sync: false
       - key: AUTH_URI
@@ -43,19 +32,3 @@ services:
         value: nvidia/nemotron-3.5-super-vl:free
       - key: EIA_API_KEY
         sync: false
-
-  - type: web
-    name: bright-ledger-frontend
-    runtime: static
-    plan: free
-    buildCommand: npm ci && npm run build:frontend
-    staticPublishPath: ./frontend/dist
-    envVars:
-      - key: NODE_VERSION
-        value: 22.12.0
-      - key: VITE_API_BASE_URL
-        sync: false
-    routes:
-      - type: rewrite
-        source: /*
-        destination: /index.html

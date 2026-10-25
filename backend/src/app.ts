@@ -69,6 +69,12 @@ const tradingInterface = new Interface([
   'event TradePaymentReleased(bytes32 indexed tradeId,address indexed seller,uint256 amountWei)',
   'event TradePaymentRefunded(bytes32 indexed tradeId,address indexed buyer,uint256 amountWei)',
 ])
+function findTradeEvent(receipt: Awaited<ReturnType<NonNullable<typeof provider>['getTransactionReceipt']>>, name: string, tradeId: string) {
+  return receipt?.logs
+    .filter((log) => log.address.toLowerCase() === contractAddress.toLowerCase())
+    .map((log) => { try { return tradingInterface.parseLog(log) } catch { return null } })
+    .find((event) => event?.name === name && event.args.tradeId === tradeId)
+}
 
 api.get('/api/health', asyncRoute(async (_request, response) => {
   await query('SELECT 1')
@@ -109,6 +115,15 @@ api.use('/api', requireAuth)
 api.get('/api/me', (request, response) => {
   response.json({ id: request.user!.id, username: request.user!.username, displayName: request.user!.displayName, role: request.user!.role, walletAddress: request.user!.walletAddress, authMethod: request.user!.authMethod ?? 'wallet' })
 })
+api.patch('/api/me/role', asyncRoute(async (request, response) => {
+  const { role } = z.object({ role: z.enum(['prosumer', 'consumer', 'both', 'funder']) }).parse(request.body)
+  if (!['prosumer', 'consumer', 'both', 'funder'].includes(request.user!.role)) {
+    throw new HttpError(403, 'Verifier, administrator, and energy-host roles are managed by the platform operator.', 'ROLE_CHANGE_NOT_ALLOWED')
+  }
+  await query('UPDATE users SET role=$2 WHERE id=$1', [request.user!.id, role])
+  request.user!.role = role
+  response.json({ role })
+}))
 api.delete('/api/auth/session', revokeCurrentSession)
 api.post('/api/auth/account-removal-challenge', createAccountRemovalChallenge)
 api.post('/api/auth/wallet-link/nonce', createWalletLinkNonce)
@@ -143,7 +158,9 @@ api.get('/api/bootstrap', asyncRoute(async (request, response) => {
       `SELECT t.public_id AS id,b.display_name AS buyer,s.display_name AS seller,
         b.wallet_address AS "buyerWalletAddress",s.wallet_address AS "sellerWalletAddress",t.quantity_kwh AS quantity,
         t.price_per_kwh AS price,t.status,t.created_at AS "createdAt",t.chain_tx_hash AS "chainTxHash",
-        coalesce((SELECT count(*) FROM trade_confirmations c WHERE c.trade_id=t.id),0)::int AS confirmations
+        coalesce((SELECT count(*) FROM trade_confirmations c WHERE c.trade_id=t.id),0)::int AS confirmations,
+        EXISTS(SELECT 1 FROM trade_confirmations c WHERE c.trade_id=t.id AND c.user_id=$1) AS "hasConfirmed",
+        EXISTS(SELECT 1 FROM evidence e WHERE e.trade_id=t.id) AS "hasEvidence"
        FROM trades t JOIN users b ON b.id=t.buyer_id JOIN users s ON s.id=t.seller_id
        WHERE t.buyer_id=$1 OR t.seller_id=$1
        ORDER BY t.created_at DESC LIMIT 100`,
@@ -154,6 +171,7 @@ api.get('/api/bootstrap', asyncRoute(async (request, response) => {
         e.interval_start AS "intervalStart",e.interval_end AS "intervalEnd",e.status,t.public_id AS trade,
         e.rejection_reason AS reason,e.evidence_hash AS "evidenceHash",e.chain_tx_hash AS "chainTxHash",
         e.evidence_reference AS reference,e.evidence_file_sha256 AS "evidenceFileSha256",
+        t.buyer_id=$1 AS "buyerCanReview",t.status AS "tradeStatus",
         EXISTS(SELECT 1 FROM evidence_files ef WHERE ef.evidence_id=e.id) AS "evidenceFileAvailable",
         air.id AS "aiReviewId",air.model AS "aiModel",air.analysis AS "aiReview"
        FROM evidence e JOIN trades t ON t.id=e.trade_id JOIN users s ON s.id=e.submitter_id
@@ -199,7 +217,14 @@ api.get('/api/bootstrap', asyncRoute(async (request, response) => {
   ])
   response.json({
     listings: listings.rows.map((row) => ({ ...row, quantity: Number(row.quantity), price: Number(row.price), window: `${new Date(row.deliveryStart).toLocaleDateString('en-US', { weekday: 'short', hour: '2-digit', minute: '2-digit' })}–${new Date(row.deliveryEnd).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}` })),
-    trades: trades.rows.map((row) => ({ ...row, quantity: Number(row.quantity), price: Number(row.price), status: uiTradeStatus(row.status), time: new Date(row.createdAt).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }), hash: row.chainTxHash ?? 'Not submitted' })),
+    trades: trades.rows.map((row) => ({
+      ...row,
+      quantity: Number(row.quantity),
+      price: Number(row.price),
+      status: uiTradeStatus(row.status === 'evidence_needed' && provider && contractAddress && !row.chainTxHash && !row.hasEvidence ? 'awaiting_buyer_escrow' : row.status),
+      time: new Date(row.createdAt).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }),
+      hash: row.chainTxHash ?? 'Not submitted',
+    })),
     evidence: evidence.rows.map((row) => ({ ...row, quantity: Number(row.quantity), interval: `${new Date(row.intervalStart).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' })} – ${new Date(row.intervalEnd).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}` })),
     projects: projects.rows.map((row, index) => ({ ...row, area: Number(row.area), capacity: Number(row.capacity), target: Number(row.target), raised: Number(row.raised), image: ['sunrise', 'courtyard', 'hub'][index % 3] })),
     contributions: contributions.rows.map((row) => ({ ...row, amount: Number(row.amount), time: new Date(row.createdAt).toLocaleDateString('en-US', { dateStyle: 'medium' }) })),
@@ -355,7 +380,9 @@ api.post('/api/trades/:id/confirm', requireLinkedWallet, asyncRoute(async (reque
     const confirmations = await client.query<{ count: number }>('SELECT count(*)::int AS count FROM trade_confirmations WHERE trade_id=$1', [row.id])
     const status = row.status === 'committed'
       ? 'committed'
-      : confirmations.rows[0].count >= 2 ? 'evidence_needed' : 'awaiting_confirmation'
+      : confirmations.rows[0].count >= 2
+        ? provider && contractAddress ? 'awaiting_buyer_escrow' : 'evidence_needed'
+        : 'awaiting_confirmation'
     await client.query('UPDATE trades SET status=$2,updated_at=now() WHERE id=$1', [row.id, status])
     await writeAudit(client, request.user!.id, 'trade.participant_confirmed', 'trade', routeId(request), { confirmations: confirmations.rows[0].count })
     const otherPartyId = row.buyerId === request.user!.id ? row.sellerId : row.buyerId
@@ -377,7 +404,7 @@ api.post('/api/trades/:id/commitment', requireLinkedWallet, asyncRoute(async (re
   )
   const trade = result.rows[0]
   if (!trade) throw new HttpError(404, 'Trade not found.', 'TRADE_NOT_FOUND')
-  if (trade.status !== 'evidence_needed' || trade.chainTxHash) throw new HttpError(409, 'This trade is not awaiting a first on-chain commitment.', 'INVALID_TRADE_STATE')
+  if (!['awaiting_buyer_escrow', 'evidence_needed'].includes(trade.status) || trade.chainTxHash) throw new HttpError(409, 'This trade is not awaiting a first on-chain commitment.', 'INVALID_TRADE_STATE')
   if (!trade.buyer || !trade.seller) throw new HttpError(409, 'Both trade participants need a registered wallet address.', 'PARTICIPANT_WALLETS_REQUIRED')
   if (trade.buyer?.toLowerCase() !== request.user!.walletAddress?.toLowerCase()) {
     throw new HttpError(403, 'Only the buyer can authorize and fund the on-chain trade commitment.', 'FORBIDDEN')
@@ -407,7 +434,7 @@ api.post('/api/trades/:id/commitment', requireLinkedWallet, asyncRoute(async (re
   }
   const updated = await query(
     `UPDATE trades SET chain_id=$2,contract_address=$3,chain_tx_hash=$4,status='committed',updated_at=now()
-     WHERE id=$1 AND status='evidence_needed' AND chain_tx_hash IS NULL`,
+     WHERE id=$1 AND status IN ('awaiting_buyer_escrow','evidence_needed') AND chain_tx_hash IS NULL`,
     [trade.id, chainId, contractAddress, input.transactionHash],
   )
   if (!updated.rowCount) throw new HttpError(409, 'Trade state changed before the commitment was recorded.', 'INVALID_TRADE_STATE')
@@ -424,11 +451,7 @@ api.post('/api/trades/:id/evidence', requireLinkedWallet, receiveEvidenceUpload,
     evidenceReference: z.string().max(500).optional().default(''),
     evidenceFileSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
     aiReviewId: z.string().uuid().optional(),
-    chainTransactionHash: z.string().regex(/^0x[a-fA-F0-9]{64}$/).optional(),
   }).parse(request.body)
-  if (request.user!.demoKey && input.chainTransactionHash) {
-    throw new HttpError(400, 'Demo profiles cannot attach unverified wallet transaction receipts.', 'DEMO_CHAIN_ACTION_UNAVAILABLE')
-  }
   const uploadedFile = request.file
   const inspectedFile = uploadedFile ? inspectEvidenceFile(uploadedFile) : null
   if (uploadedFile && input.evidenceFileSha256 && input.evidenceFileSha256 !== inspectedFile?.sha256) {
@@ -447,7 +470,9 @@ api.post('/api/trades/:id/evidence', requireLinkedWallet, receiveEvidenceUpload,
     const trade = tradeResult.rows[0]
     if (!trade) throw new HttpError(404, 'Trade not found.', 'TRADE_NOT_FOUND')
     if (trade.sellerId !== request.user!.id) throw new HttpError(403, 'Only the energy seller can submit delivery evidence.', 'FORBIDDEN')
-    if (!['committed', 'evidence_needed', 'disputed'].includes(trade.status)) throw new HttpError(409, 'Trade is not ready to receive evidence.', 'INVALID_TRADE_STATE')
+    const maySubmitEvidence = trade.status === 'committed' ||
+      (!contractAddress && ['evidence_needed', 'awaiting_buyer_escrow'].includes(trade.status))
+    if (!maySubmitEvidence) throw new HttpError(409, 'The buyer must fund the escrow before the seller can submit delivery evidence.', 'BUYER_ESCROW_REQUIRED')
     if (input.quantity > Number(trade.quantity)) throw new HttpError(400, 'Evidence quantity cannot exceed the committed trade quantity.', 'EVIDENCE_EXCEEDS_TRADE')
     if (input.aiReviewId) {
       const review = await client.query<{ fileSha256: string }>(
@@ -469,21 +494,11 @@ api.post('/api/trades/:id/evidence', requireLinkedWallet, receiveEvidenceUpload,
       reference: input.evidenceReference,
       ...(evidenceFileSha256 ? { evidenceFileSha256 } : {}),
     })))
-    if (contractAddress && !request.user!.demoKey) {
-      if (!input.chainTransactionHash) throw new HttpError(409, 'Submit the evidence hash to the configured contract before recording it.', 'CHAIN_EVIDENCE_REQUIRED')
-      const receipt = await provider!.getTransactionReceipt(input.chainTransactionHash)
-      const event = receipt?.logs.filter((log) => log.address.toLowerCase() === contractAddress.toLowerCase()).map((log) => { try { return tradingInterface.parseLog(log) } catch { return null } })
-        .find((item) => item?.name === 'EvidenceSubmitted' && item.args.tradeId === keccak256(toUtf8Bytes(trade.publicId)) && item.args.evidenceHash === evidenceHash)
-      if (!receipt || receipt.status !== 1 || receipt.to?.toLowerCase() !== contractAddress.toLowerCase() ||
-        receipt.from.toLowerCase() !== request.user!.walletAddress?.toLowerCase() || !event) {
-        throw new HttpError(422, 'Confirmed contract evidence event does not match the submitted evidence.', 'INVALID_CHAIN_EVIDENCE')
-      }
-    }
     const inserted = await client.query(
       `INSERT INTO evidence(public_id,trade_id,submitter_id,quantity_kwh,source,interval_start,interval_end,evidence_hash,chain_tx_hash,evidence_reference,evidence_file_sha256,ai_review_id)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,NULL,$9,$10,$11)
        RETURNING public_id AS id,quantity_kwh AS quantity,source,status,evidence_hash AS "evidenceHash",evidence_reference AS reference,evidence_file_sha256 AS "evidenceFileSha256",ai_review_id AS "aiReviewId"`,
-      [publicId, trade.id, request.user!.id, input.quantity, input.source, input.intervalStart, input.intervalEnd, evidenceHash, input.chainTransactionHash ?? null, input.evidenceReference, evidenceFileSha256 ?? null, input.aiReviewId ?? null],
+      [publicId, trade.id, request.user!.id, input.quantity, input.source, input.intervalStart, input.intervalEnd, evidenceHash, input.evidenceReference, evidenceFileSha256 ?? null, input.aiReviewId ?? null],
     )
     if (uploadedFile && inspectedFile) {
       const extension = uploadedFile.originalname.split(/[\\/]/).pop()?.match(/\.[a-zA-Z0-9]+$/)?.[0].toLowerCase()
@@ -497,13 +512,7 @@ api.post('/api/trades/:id/evidence', requireLinkedWallet, receiveEvidenceUpload,
       )
     }
     await client.query("UPDATE trades SET status='under_review',updated_at=now() WHERE id=$1", [trade.id])
-    await writeNotification(client, trade.buyerId, `evidence:${publicId}:submitted`, 'Delivery evidence submitted', `${trade.publicId} · ${input.quantity} kWh awaits an authorized review.`, 'Evidence')
-    const reviewers = await client.query<{ id: string }>(
-      `SELECT id FROM users WHERE role IN ('verifier','admin') AND wallet_address IS NOT NULL AND demo_key IS NULL`,
-    )
-    for (const reviewer of reviewers.rows) {
-      await writeNotification(client, reviewer.id, `evidence:${publicId}:review-required`, 'Evidence awaiting review', `${trade.publicId} · ${input.quantity} kWh`, 'Evidence')
-    }
+    await writeNotification(client, trade.buyerId, `evidence:${publicId}:submitted`, 'Delivery evidence needs your review', `${trade.publicId} · ${input.quantity} kWh`, 'Evidence')
     await writeAudit(client, request.user!.id, 'evidence.submitted', 'trade', trade.publicId, { evidenceId: publicId, quantityKwh: input.quantity, source: input.source, evidenceHash, fileAttached: Boolean(uploadedFile), evidenceFileSha256: evidenceFileSha256 ?? null })
     return inserted.rows[0]
   })
@@ -554,7 +563,9 @@ api.post('/api/trades/:id/evidence/ai-review', requireLinkedWallet, rateLimit({ 
   const trade = tradeResult.rows[0]
   if (!trade) throw new HttpError(404, 'Trade not found.', 'TRADE_NOT_FOUND')
   if (trade.sellerId !== request.user!.id) throw new HttpError(403, 'Only the energy seller can submit delivery evidence.', 'FORBIDDEN')
-  if (!['committed', 'evidence_needed', 'disputed'].includes(trade.status)) throw new HttpError(409, 'Trade is not ready to receive evidence.', 'INVALID_TRADE_STATE')
+  const mayReviewEvidence = trade.status === 'committed' ||
+    (!contractAddress && ['evidence_needed', 'awaiting_buyer_escrow'].includes(trade.status))
+  if (!mayReviewEvidence) throw new HttpError(409, 'The buyer must fund the escrow before the seller can submit delivery evidence.', 'BUYER_ESCROW_REQUIRED')
   const result = await reviewEvidenceFile(file, inspected.kind, { tradeId: trade.publicId, quantityKwh: Number(trade.quantity) })
   const saved = await transaction(async (client) => {
     const inserted = await client.query<{ id: string }>(
@@ -568,65 +579,146 @@ api.post('/api/trades/:id/evidence/ai-review', requireLinkedWallet, rateLimit({ 
   response.json({ data: { id: saved.id, fileSha256: inspected.sha256, model: result.model, analysis: result.analysis } })
 }))
 
-api.post('/api/evidence/:id/review', requireLinkedWallet, allowRoles('verifier', 'admin'), asyncRoute(async (request, response) => {
+api.post('/api/evidence/:id/review', requireLinkedWallet, asyncRoute(async (request, response) => {
   const input = z.object({
     decision: z.enum(['approve', 'reject']),
     reason: z.string().trim().max(500).optional(),
     chainTransactionHash: z.string().regex(/^0x[a-fA-F0-9]{64}$/).optional(),
   }).parse(request.body)
-  if (request.user!.demoKey && input.chainTransactionHash) {
-    throw new HttpError(400, 'Demo profiles cannot attach unverified wallet transaction receipts.', 'DEMO_CHAIN_ACTION_UNAVAILABLE')
-  }
-  if (input.decision === 'reject' && !input.reason) throw new HttpError(400, 'A rejection reason is required.', 'REJECTION_REASON_REQUIRED')
+  if (input.decision === 'reject' && !input.reason) throw new HttpError(400, 'A reason is required when opening or resolving a dispute.', 'REJECTION_REASON_REQUIRED')
   const result = await transaction(async (client) => {
-    const current = await client.query<{ id: string; tradeId: string; tradePublicId: string; buyerId: string; sellerId: string; buyerWallet: string; commitTxHash: string | null; submitterId: string; status: string; quantity: string }>(
+    const current = await client.query<{
+      id: string; tradeId: string; tradePublicId: string; buyerId: string; sellerId: string;
+      buyerWallet: string; sellerWallet: string; commitTxHash: string | null;
+      submitterId: string; evidenceStatus: string; tradeStatus: string; quantity: string; evidenceHash: string;
+    }>(
       `SELECT e.id,e.trade_id AS "tradeId",t.public_id AS "tradePublicId",t.buyer_id AS "buyerId",t.seller_id AS "sellerId",
-        buyer.wallet_address AS "buyerWallet",t.chain_tx_hash AS "commitTxHash",
-        e.submitter_id AS "submitterId",e.status,e.quantity_kwh AS quantity
-       FROM evidence e JOIN trades t ON t.id=e.trade_id JOIN users buyer ON buyer.id=t.buyer_id
+        buyer.wallet_address AS "buyerWallet",seller.wallet_address AS "sellerWallet",t.chain_tx_hash AS "commitTxHash",
+        e.submitter_id AS "submitterId",e.status AS "evidenceStatus",t.status AS "tradeStatus",
+        e.quantity_kwh AS quantity,e.evidence_hash AS "evidenceHash"
+       FROM evidence e JOIN trades t ON t.id=e.trade_id
+       JOIN users buyer ON buyer.id=t.buyer_id JOIN users seller ON seller.id=t.seller_id
        WHERE e.public_id=$1 FOR UPDATE OF e,t`,
-      [request.params.id],
+      [routeId(request)],
     )
     const evidence = current.rows[0]
     if (!evidence) throw new HttpError(404, 'Evidence record not found.', 'EVIDENCE_NOT_FOUND')
-    if (evidence.submitterId === request.user!.id) throw new HttpError(403, 'A verifier cannot approve their own evidence submission.', 'SELF_REVIEW')
-    if (evidence.status !== 'pending') throw new HttpError(409, 'Evidence has already been reviewed.', 'ALREADY_REVIEWED')
-    const confirmations = await client.query<{ count: number }>('SELECT count(*)::int AS count FROM trade_confirmations WHERE trade_id=$1', [evidence.tradeId])
+    const isBuyer = evidence.buyerId === request.user!.id
+    const isReviewer = ['verifier', 'admin'].includes(request.user!.role)
+    const resolvingDispute = isReviewer && evidence.evidenceStatus === 'disputed' && evidence.tradeStatus === 'disputed'
+    if (isBuyer && (evidence.evidenceStatus !== 'pending' || evidence.tradeStatus !== 'under_review')) {
+      throw new HttpError(409, 'Only evidence awaiting buyer review can be accepted or disputed.', 'INVALID_EVIDENCE_STATE')
+    }
+    if (!isBuyer && !resolvingDispute) {
+      throw new HttpError(403, 'The buyer reviews delivery evidence. Verifiers may only resolve an open dispute.', 'FORBIDDEN')
+    }
+    if (evidence.submitterId === request.user!.id) throw new HttpError(403, 'The evidence submitter cannot review their own evidence.', 'SELF_REVIEW')
+    const confirmations = await client.query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM trade_confirmations WHERE trade_id=$1',
+      [evidence.tradeId],
+    )
     if (confirmations.rows[0].count < 2) throw new HttpError(409, 'Both trade participants must confirm before evidence can be reviewed.', 'TRADE_CONFIRMATIONS_REQUIRED')
-    const status = input.decision === 'approve' ? 'approved' : 'rejected'
-    if (contractAddress && !request.user!.demoKey) {
-      if (!input.chainTransactionHash) throw new HttpError(409, 'Submit the evidence review to the configured contract first.', 'CHAIN_REVIEW_REQUIRED')
-      const receipt = await provider!.getTransactionReceipt(input.chainTransactionHash)
+
+    const hasContract = Boolean(contractAddress && !request.user!.demoKey)
+    if (hasContract && !input.chainTransactionHash) {
+      throw new HttpError(409, 'Confirm this decision in your wallet before updating the trade.', 'CHAIN_REVIEW_REQUIRED')
+    }
+    if (hasContract) {
+      if (!provider) throw new HttpError(503, 'The configured blockchain RPC is unavailable.', 'CHAIN_NOT_CONFIGURED')
+      const receipt = await provider.getTransactionReceipt(input.chainTransactionHash!)
+      const chainTransaction = await provider.getTransaction(input.chainTransactionHash!)
+      const tradeHash = keccak256(toUtf8Bytes(evidence.tradePublicId))
       const reasonHash = keccak256(toUtf8Bytes(input.reason ?? ''))
-      const event = receipt?.logs.filter((log) => log.address.toLowerCase() === contractAddress.toLowerCase()).map((log) => { try { return tradingInterface.parseLog(log) } catch { return null } })
-        .find((item) => item?.name === 'EvidenceReviewed' && item.args.tradeId === keccak256(toUtf8Bytes(evidence.tradePublicId)) && item.args.approved === (input.decision === 'approve') && item.args.reasonHash === reasonHash)
-      if (!receipt || receipt.status !== 1 || receipt.to?.toLowerCase() !== contractAddress.toLowerCase() ||
-        receipt.from.toLowerCase() !== request.user!.walletAddress?.toLowerCase() || !event) {
-        throw new HttpError(422, 'Confirmed contract review event does not match the requested decision.', 'INVALID_CHAIN_REVIEW')
+      const submitted = findTradeEvent(receipt, 'EvidenceSubmitted', tradeHash)
+      const reviewed = findTradeEvent(receipt, 'EvidenceReviewed', tradeHash)
+      const settled = findTradeEvent(receipt, 'TradeSettled', tradeHash)
+      const released = findTradeEvent(receipt, 'TradePaymentReleased', tradeHash)
+      const refunded = findTradeEvent(receipt, 'TradePaymentRefunded', tradeHash)
+      const expectedSender = isBuyer ? evidence.buyerWallet : request.user!.walletAddress
+      const expectedReasonHash = isBuyer && input.decision === 'approve' ? `0x${'0'.repeat(64)}` : reasonHash
+      if (!receipt || !chainTransaction || receipt.status !== 1 ||
+        receipt.to?.toLowerCase() !== contractAddress.toLowerCase() ||
+        receipt.from.toLowerCase() !== request.user!.walletAddress?.toLowerCase() ||
+        chainTransaction.from.toLowerCase() !== expectedSender?.toLowerCase() ||
+        !reviewed || reviewed.args.approved !== (input.decision === 'approve') ||
+        reviewed.args.reasonHash !== expectedReasonHash) {
+        throw new HttpError(422, 'Confirmed contract decision does not match this evidence review.', 'INVALID_CHAIN_REVIEW')
       }
-      if (chainId === 11155111 && input.decision === 'reject') {
-        if (!evidence.commitTxHash) throw new HttpError(409, 'The escrow commitment transaction is missing.', 'CHAIN_COMMITMENT_REQUIRED')
-        const commitmentReceipt = await provider!.getTransactionReceipt(evidence.commitTxHash)
-        const commitment = commitmentReceipt?.logs.filter((log) => log.address.toLowerCase() === contractAddress.toLowerCase())
-          .map((log) => { try { return tradingInterface.parseLog(log) } catch { return null } })
-          .find((item) => item?.name === 'TradeCommitted' && item.args.tradeId === keccak256(toUtf8Bytes(evidence.tradePublicId)))
-        const refund = receipt.logs.filter((log) => log.address.toLowerCase() === contractAddress.toLowerCase()).map((log) => { try { return tradingInterface.parseLog(log) } catch { return null } })
-          .find((item) => item?.name === 'TradePaymentRefunded' && item.args.tradeId === keccak256(toUtf8Bytes(evidence.tradePublicId)))
-        if (!commitment || !refund || getAddress(refund.args.buyer) !== getAddress(evidence.buyerWallet) ||
-          BigInt(refund.args.amountWei) !== BigInt(commitment.args.paymentWei)) {
-          throw new HttpError(422, 'Rejected evidence transaction did not refund escrow to the buyer.', 'INVALID_CHAIN_REFUND')
+      if (isBuyer && (!submitted || submitted.args.evidenceHash !== evidence.evidenceHash)) {
+        throw new HttpError(422, 'The buyer decision is not bound to the submitted evidence record.', 'INVALID_CHAIN_EVIDENCE')
+      }
+      if (input.decision === 'approve' && (!settled ||
+        getAddress(settled.args.buyer) !== getAddress(evidence.buyerWallet) ||
+        getAddress(settled.args.seller) !== getAddress(evidence.sellerWallet))) {
+        throw new HttpError(422, 'The approved evidence transaction did not settle this trade.', 'INVALID_CHAIN_SETTLEMENT')
+      }
+      if (chainId === 11155111 && input.decision === 'approve') {
+        if (!evidence.commitTxHash) throw new HttpError(409, 'The buyer escrow transaction is missing.', 'CHAIN_COMMITMENT_REQUIRED')
+        const commitment = findTradeEvent(await provider.getTransactionReceipt(evidence.commitTxHash), 'TradeCommitted', tradeHash)
+        if (!commitment || !released ||
+          getAddress(released.args.seller) !== getAddress(evidence.sellerWallet) ||
+          BigInt(released.args.amountWei) !== BigInt(commitment.args.paymentWei)) {
+          throw new HttpError(422, 'The transaction did not release the full escrow to the seller.', 'INVALID_CHAIN_PAYMENT')
+        }
+      }
+      if (resolvingDispute && input.decision === 'reject' && chainId === 11155111) {
+        if (!evidence.commitTxHash) throw new HttpError(409, 'The buyer escrow transaction is missing.', 'CHAIN_COMMITMENT_REQUIRED')
+        const commitment = findTradeEvent(await provider.getTransactionReceipt(evidence.commitTxHash), 'TradeCommitted', tradeHash)
+        if (!commitment || !refunded ||
+          getAddress(refunded.args.buyer) !== getAddress(evidence.buyerWallet) ||
+          BigInt(refunded.args.amountWei) !== BigInt(commitment.args.paymentWei)) {
+          throw new HttpError(422, 'The dispute resolution did not refund the full escrow to the buyer.', 'INVALID_CHAIN_REFUND')
         }
       }
     }
-    await client.query('UPDATE evidence SET status=$2,reviewer_id=$3,rejection_reason=$4,reviewed_at=now(),chain_tx_hash=$5 WHERE id=$1', [evidence.id, status, request.user!.id, input.reason ?? null, input.chainTransactionHash ?? null])
-    await client.query('UPDATE trades SET status=$2,updated_at=now() WHERE id=$1', [evidence.tradeId, input.decision === 'approve' ? 'ready_to_settle' : 'disputed'])
-    for (const userId of new Set([evidence.buyerId, evidence.sellerId])) {
-      if (userId !== request.user!.id) {
-        await writeNotification(client, userId, `evidence:${request.params.id}:reviewed`, `Evidence ${status}`, `${evidence.tradePublicId} · ${input.decision === 'approve' ? 'approved' : 'rejected'} by an authorized reviewer.`, 'Evidence')
+
+    const buyerDispute = isBuyer && input.decision === 'reject'
+    const evidenceStatus = buyerDispute ? 'disputed' : input.decision === 'approve' ? 'approved' : 'rejected'
+    const tradeStatus = buyerDispute
+      ? 'disputed'
+      : hasContract
+        ? input.decision === 'approve' ? 'settled' : 'refunded'
+        : input.decision === 'approve' ? 'ready_to_settle' : 'cancelled'
+    await client.query(
+      'UPDATE evidence SET status=$2,reviewer_id=$3,rejection_reason=$4,reviewed_at=now(),chain_tx_hash=$5 WHERE id=$1',
+      [evidence.id, evidenceStatus, isBuyer ? null : request.user!.id, input.reason ?? null, input.chainTransactionHash ?? null],
+    )
+    await client.query('UPDATE trades SET status=$2,updated_at=now() WHERE id=$1', [evidence.tradeId, tradeStatus])
+    if (buyerDispute) {
+      const reviewers = await client.query<{ id: string }>(
+        `SELECT id FROM users WHERE role IN ('verifier','admin') AND wallet_address IS NOT NULL AND demo_key IS NULL`,
+      )
+      for (const reviewer of reviewers.rows) {
+        await writeNotification(client, reviewer.id, `evidence:${routeId(request)}:dispute`, 'Trade dispute needs review', `${evidence.tradePublicId} · ${input.reason}`, 'Evidence')
       }
     }
-    await writeAudit(client, request.user!.id, input.decision === 'approve' ? 'evidence.approved' : 'evidence.rejected', 'trade', evidence.tradePublicId, { evidenceId: request.params.id, reason: input.reason })
-    return { evidenceId: request.params.id, tradeId: evidence.tradePublicId, status }
+    for (const userId of new Set([evidence.buyerId, evidence.sellerId])) {
+      if (userId !== request.user!.id) {
+        await writeNotification(
+          client,
+          userId,
+          `evidence:${routeId(request)}:reviewed`,
+          buyerDispute ? 'Trade dispute opened' : `Evidence ${evidenceStatus}`,
+          buyerDispute
+            ? `${evidence.tradePublicId} · escrow remains locked pending dispute resolution.`
+            : `${evidence.tradePublicId} · ${input.decision === 'approve' ? 'approved' : 'rejected'} by ${isBuyer ? 'the buyer' : 'an authorized verifier'}.`,
+          'Evidence',
+        )
+      }
+    }
+    if (tradeStatus === 'settled') {
+      const points = Math.max(1, Math.floor(Number(evidence.quantity) * 10))
+      await client.query(
+        'INSERT INTO rewards(trade_id,user_id,points) VALUES($1,$2,$3),($1,$4,$3) ON CONFLICT(trade_id,user_id) DO NOTHING',
+        [evidence.tradeId, evidence.sellerId, points, evidence.buyerId],
+      )
+    }
+    await writeAudit(client, request.user!.id, `evidence.${evidenceStatus}`, 'trade', evidence.tradePublicId, {
+      evidenceId: routeId(request),
+      reason: input.reason,
+      transactionHash: input.chainTransactionHash ?? null,
+    })
+    return { evidenceId: routeId(request), tradeId: evidence.tradePublicId, evidenceStatus, tradeStatus }
   })
   response.json({ data: result })
 }))
@@ -991,12 +1083,14 @@ async function writeNotification(
 function uiTradeStatus(status: string) {
   const labels: Record<string, string> = {
     awaiting_confirmation: 'Awaiting confirmation',
+    awaiting_buyer_escrow: 'Awaiting buyer escrow',
     committed: 'Evidence needed',
     evidence_needed: 'Evidence needed',
     under_review: 'Under review',
     ready_to_settle: 'Ready to settle',
     disputed: 'Disputed',
     settled: 'Settled',
+    refunded: 'Refunded',
     cancelled: 'Cancelled',
   }
   return labels[status] ?? status

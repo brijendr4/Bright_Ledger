@@ -32,12 +32,13 @@ import {
   Zap,
 } from 'lucide-react'
 import { apiGet, apiGetBlob, apiPatch, apiPost, apiUpload, ApiError, authenticatePassword, clearAccessToken, clearLegacyAccessToken, getCurrentUser, hasAccessToken, linkWalletWithSignature, removeWalletAccountWithSignature, revokeWalletSession, signInWallet } from './lib/api'
-import { commitTradeOnChain, getTradePaymentQuote, makeEvidenceHash, reviewEvidenceOnChain, settleTradeOnChain, submitEvidenceOnChain } from './lib/chain'
+import { approveEvidenceOnChain, commitTradeOnChain, getTradePaymentQuote, raiseDisputeOnChain, resolveDisputeOnChain, settleTradeOnChain } from './lib/chain'
 import { discoverEvmWallets, getActiveEvmWallet, selectEvmWallet, type EvmWalletInfo } from './lib/wallet'
 import './App.css'
 
 type Page = 'Overview' | 'Energy market' | 'My offers' | 'My requests' | 'Trades' | 'Evidence' | 'Rewards' | 'Solar projects' | 'Activity' | 'Settings'
-type Role = 'Prosumer' | 'Consumer' | 'Both' | 'Verifier' | 'Admin' | 'Funder' | 'Space owner'
+type Role = 'Energy Producer' | 'Energy Consumer' | 'Producer & Consumer' | 'Verifier' | 'Admin' | 'Investor' | 'Project Owner'
+type MarketplaceRole = 'prosumer' | 'consumer' | 'both' | 'funder'
 type Listing = {
   id: string
   type: 'offer' | 'request'
@@ -61,10 +62,11 @@ type Trade = {
   hash: string
   buyerWalletAddress?: string | null
   sellerWalletAddress?: string | null
+  hasConfirmed?: boolean
 }
 type EvidenceAiAnalysis = { summary: string; confidence: 'low' | 'medium' | 'high'; flags: string[]; suggestedChecks: string[] }
 type EvidenceAiReview = { id: string; fileSha256: string; model: string; analysis: EvidenceAiAnalysis }
-type Evidence = { id: string; project: string; source: string; quantity: number; interval: string; status: 'Pending' | 'Approved' | 'Rejected'; trade: string; reason?: string; reference?: string; evidenceFileSha256?: string; evidenceFileAvailable?: boolean; aiReview?: EvidenceAiReview | null }
+type Evidence = { id: string; project: string; source: string; quantity: number; interval: string; status: 'Pending' | 'Approved' | 'Rejected' | 'Disputed'; trade: string; evidenceHash: string; buyerCanReview: boolean; tradeStatus: string; reason?: string; reference?: string; evidenceFileSha256?: string; evidenceFileAvailable?: boolean; aiReview?: EvidenceAiReview | null }
 type Project = { id: string; name: string; location: string; area: number; target: number; raised: number; capacity: number; owner: string; ownerId?: string; status: string; image: string; siteType: string; permission: string; notes: string; estimateModel: string; fundingMethodology: string; estimateReviewSummary: string; estimateReviewConfidence: string; estimateLimitation: string }
 type Contribution = { id: string; projectId: string; contributor: string; amount: number; time: string; status: string }
 type SolarWorkspaceData = {
@@ -124,8 +126,8 @@ const tourSteps: { page: Page; target: string; title: string; description: strin
   { page: 'Energy market', target: '.segmented-tabs', title: 'Compare offers and requests', description: 'Switch between Energy offers and Buy requests. Compare each listing’s quantity, seller-set USD/kWh price, area, source, and delivery window before proposing a match.' },
   { page: 'My offers', target: 'offer-form', title: 'Create an energy offer', description: 'Choose Offer, then enter available energy in kWh, your asking price in USD/kWh, city and country, renewable source, and delivery window. The price is your choice; Bright Ledger does not calculate it.' },
   { page: 'My requests', target: 'request-form', title: 'Post a buyer request', description: 'Choose Request, then enter the energy quantity you need, the maximum USD/kWh you are willing to pay, your area, source preference, and delivery window. Matching is based on the listing terms.' },
-  { page: 'Trades', target: '.trade-flow', title: 'Follow the trade workflow', description: 'A match records the agreed quantity and price. Participants confirm terms, submit delivery evidence, review it, and then record settlement. This workflow does not transfer funds or deliver power.' },
-  { page: 'Evidence', target: 'evidence', title: 'Submit and review evidence', description: 'From a trade marked Evidence needed, report delivered kWh, choose the reading source and interval, and optionally attach meter or inverter evidence. Review status and AI checks are not independent verification.' },
+  { page: 'Trades', target: '.trade-flow', title: 'Follow the trade workflow', description: 'Both participants confirm terms. The buyer funds configured escrow, the seller submits delivery evidence, and the buyer approves release or opens a dispute for verifier resolution.' },
+  { page: 'Evidence', target: 'evidence', title: 'Submit and review evidence', description: 'The seller reports delivered kWh, selects a reading source and interval, and can attach meter or inverter evidence. The buyer reviews the record; AI checks are advisory only.' },
   { page: 'Solar projects', target: 'projects', title: 'Submit a community solar site', description: 'Add the site name, location, site type, usable area, permission status, notes, and an illustrative funding target. The capacity estimate is approximate; submissions need review and contributions are simulated.' },
 ]
 
@@ -224,7 +226,7 @@ function App() {
   const [state, setState] = useState<AppState>(emptyState)
   const [page, setPage] = useState<Page>('Overview')
   const [authenticatedWorkspace, setAuthenticatedWorkspace] = useState(false)
-  const [role, setRole] = useState<Role>('Prosumer')
+  const [role, setRole] = useState<Role>('Energy Producer')
   const [authMode, setAuthMode] = useState<'none' | 'wallet' | 'password'>('none')
   const [apiConnected, setApiConnected] = useState(false)
   const [chainEnabled, setChainEnabled] = useState(false)
@@ -309,14 +311,14 @@ function App() {
     let cancelled = false
     const initialize = async () => {
       const user = await getCurrentUser()
-      const userRole: Record<string, Role> = { prosumer: 'Prosumer', consumer: 'Consumer', both: 'Both', verifier: 'Verifier', admin: 'Admin', funder: 'Funder', space_owner: 'Space owner' }
+      const userRole: Record<string, Role> = { prosumer: 'Energy Producer', consumer: 'Energy Consumer', both: 'Producer & Consumer', verifier: 'Verifier', admin: 'Admin', funder: 'Investor', space_owner: 'Project Owner' }
       if (!cancelled) {
         setIdentity(user.displayName)
         setAccountUsername(user.username ?? '')
         setAccountId(user.id)
         setWalletAddress(user.walletAddress ?? '')
         setAuthMode(user.authMethod)
-        setRole(userRole[user.role] ?? 'Consumer')
+        setRole(userRole[user.role] ?? 'Energy Consumer')
       }
       const [snapshot, config] = await Promise.all([
         apiGet<ApiSnapshot>('/api/bootstrap'),
@@ -373,8 +375,8 @@ function App() {
       setIdentity(user.displayName)
       setAccountUsername(user.username ?? '')
       setAccountId(user.id)
-      const userRole: Record<string, Role> = { prosumer: 'Prosumer', consumer: 'Consumer', both: 'Both', verifier: 'Verifier', admin: 'Admin', funder: 'Funder', space_owner: 'Space owner' }
-      setRole(userRole[user.role] ?? 'Consumer')
+      const userRole: Record<string, Role> = { prosumer: 'Energy Producer', consumer: 'Energy Consumer', both: 'Producer & Consumer', verifier: 'Verifier', admin: 'Admin', funder: 'Investor', space_owner: 'Project Owner' }
+      setRole(userRole[user.role] ?? 'Energy Consumer')
       setAuthMode(user.authMethod)
       setAuthenticatedWorkspace(true)
     }).catch((error: unknown) => {
@@ -566,6 +568,25 @@ function App() {
     setApiConnected(true)
   }
 
+  async function changeRole(nextRole: MarketplaceRole) {
+    setApiBusy(true)
+    try {
+      await apiPatch<{ role: MarketplaceRole }>('/api/me/role', { role: nextRole })
+      const labels: Record<MarketplaceRole, Role> = {
+        prosumer: 'Energy Producer',
+        consumer: 'Energy Consumer',
+        both: 'Producer & Consumer',
+        funder: 'Investor',
+      }
+      setRole(labels[nextRole])
+      notify(`Profile role changed to ${labels[nextRole]}.`)
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Could not change your profile role.')
+    } finally {
+      setApiBusy(false)
+    }
+  }
+
   async function connectWallet() {
     const name = walletDisplayName.trim()
     if (name.length < 2) {
@@ -587,8 +608,8 @@ function App() {
       setAccountUsername(user.username ?? '')
       setAccountId(user.id)
       setWalletAddress(user.walletAddress ?? '')
-      const userRole: Record<string, Role> = { prosumer: 'Prosumer', consumer: 'Consumer', both: 'Both', verifier: 'Verifier', admin: 'Admin', funder: 'Funder', space_owner: 'Space owner' }
-      setRole(userRole[user.role] ?? 'Consumer')
+      const userRole: Record<string, Role> = { prosumer: 'Energy Producer', consumer: 'Energy Consumer', both: 'Producer & Consumer', verifier: 'Verifier', admin: 'Admin', funder: 'Investor', space_owner: 'Project Owner' }
+      setRole(userRole[user.role] ?? 'Energy Consumer')
       setAuthMode('wallet')
       setAuthenticatedWorkspace(true)
       acceptDisclosure()
@@ -617,8 +638,8 @@ function App() {
       setAccountUsername(user.username)
       setAccountId(user.id)
       setWalletAddress(user.walletAddress ?? '')
-      const userRole: Record<string, Role> = { prosumer: 'Prosumer', consumer: 'Consumer', both: 'Both', verifier: 'Verifier', admin: 'Admin', funder: 'Funder', space_owner: 'Space owner' }
-      setRole(userRole[user.role] ?? 'Consumer')
+      const userRole: Record<string, Role> = { prosumer: 'Energy Producer', consumer: 'Energy Consumer', both: 'Producer & Consumer', verifier: 'Verifier', admin: 'Admin', funder: 'Investor', space_owner: 'Project Owner' }
+      setRole(userRole[user.role] ?? 'Energy Consumer')
       setAuthMode('password')
       setAuthenticatedWorkspace(true)
       acceptDisclosure()
@@ -769,8 +790,8 @@ function App() {
       setAccountUsername(user.username ?? '')
       setAccountId(user.id)
       setWalletAddress(user.walletAddress ?? '')
-      const userRole: Record<string, Role> = { prosumer: 'Prosumer', consumer: 'Consumer', both: 'Both', verifier: 'Verifier', admin: 'Admin', funder: 'Funder', space_owner: 'Space owner' }
-      setRole(userRole[user.role] ?? 'Consumer')
+      const userRole: Record<string, Role> = { prosumer: 'Energy Producer', consumer: 'Energy Consumer', both: 'Producer & Consumer', verifier: 'Verifier', admin: 'Admin', funder: 'Investor', space_owner: 'Project Owner' }
+      setRole(userRole[user.role] ?? 'Energy Consumer')
       setAuthMode(user.authMethod)
       setAuthenticatedWorkspace(true)
     } catch (error) {
@@ -825,7 +846,7 @@ function App() {
       return
     }
     if (Object.values(revenueShares).some((share) => !Number.isInteger(share) || share < 0 || share > 100) || Object.values(revenueShares).reduce((sum, share) => sum + share, 0) !== 100) {
-      notify('Set whole-number owner, funder and community revenue shares that total exactly 100%.')
+      notify('Set whole-number Project Owner, Investor and community allocations that total exactly 100%.')
       return
     }
     try {
@@ -871,7 +892,7 @@ function App() {
     try {
       await apiPost(`/api/projects/${encodeURIComponent(project.id)}/review`, { decision, ...(reason ? { reason } : {}) })
       await refreshFromApi()
-      notify(decision === 'approve' ? 'Solar site approved and pledges are now open.' : 'Solar site rejected; the owner was notified.')
+      notify(decision === 'approve' ? 'Solar site approved; the Project Owner can publish the fundraising page.' : 'Solar site rejected; the Project Owner was notified.')
     } catch (error) {
       notify(error instanceof Error ? error.message : 'Could not review this solar site.')
     }
@@ -904,7 +925,7 @@ function App() {
     const amount = Number(new FormData(event.currentTarget).get('amount'))
     const remaining = selectedProject.target - selectedProject.raised
     if (!amount || amount <= 0 || amount > remaining) {
-      notify(`Enter a pledge up to the remaining target (${formatUSD(remaining)}).`)
+      notify(`Enter an interest amount up to the remaining project goal (${formatUSD(remaining)}).`)
       return
     }
     try {
@@ -920,22 +941,28 @@ function App() {
   }
 
   async function reviewEvidence(evidence: Evidence, decision: 'Approved' | 'Rejected') {
-    if (role !== 'Verifier' && role !== 'Admin') {
-      notify('A verifier account is required to review evidence.')
+    const isBuyerReview = evidence.buyerCanReview && evidence.status === 'Pending'
+    const isDisputeResolution = evidence.status === 'Disputed' && (role === 'Verifier' || role === 'Admin')
+    if (!isBuyerReview && !isDisputeResolution) {
+      notify('Only the buyer can approve or dispute delivery evidence. Verifiers can resolve an open dispute.')
       return
     }
-    let reason = evidence.reason
-    if (decision === 'Rejected' && !evidence.reason) {
-      const suppliedReason = window.prompt('Add a reason for rejecting this evidence:')
+    let reason = isDisputeResolution ? undefined : evidence.reason
+    if (decision === 'Rejected' && !reason) {
+      const suppliedReason = window.prompt(isBuyerReview ? 'Explain why you are opening a trade dispute:' : 'Add a reason for resolving this dispute in the seller’s favor or refunding the buyer:')
       if (!suppliedReason?.trim()) {
-        notify('A rejection reason is required.')
+        notify('A reason is required.')
         return
       }
       reason = suppliedReason.trim()
     }
     try {
       const chainTransactionHash = chainEnabled
-        ? await reviewEvidenceOnChain(evidence.trade, decision === 'Approved', reason ?? '')
+        ? isBuyerReview
+          ? decision === 'Approved'
+            ? await approveEvidenceOnChain(evidence.trade, evidence.evidenceHash)
+            : await raiseDisputeOnChain(evidence.trade, evidence.evidenceHash, reason ?? '')
+          : await resolveDisputeOnChain(evidence.trade, decision === 'Approved', reason ?? '')
         : undefined
       await apiPost(`/api/evidence/${encodeURIComponent(evidence.id)}/review`, {
         decision: decision === 'Approved' ? 'approve' : 'reject',
@@ -949,11 +976,23 @@ function App() {
     }
     setSelectedEvidence(null)
     setModal(null)
-    notify(decision === 'Approved'
-      ? 'Evidence approved. The trade is ready to settle.'
-      : chainPaymentsEnabled
-        ? 'Evidence rejected, the trade is disputed, and escrowed SepoliaETH was refunded to the buyer.'
-        : 'Evidence rejected and the trade marked disputed.')
+    if (isBuyerReview && decision === 'Rejected') {
+      notify('Dispute opened. Escrow stays locked until an authorized verifier resolves it.')
+    } else if (decision === 'Approved' && chainPaymentsEnabled) {
+      notify('Evidence approved and escrow released to the seller.')
+    } else if (isDisputeResolution && decision === 'Rejected') {
+      notify(chainPaymentsEnabled
+        ? 'Dispute resolved for the buyer and escrow refunded.'
+        : 'Dispute resolved; no on-chain payment was configured.')
+    } else if (isDisputeResolution) {
+      notify(chainEnabled
+        ? 'Dispute resolved for the seller and the trade record settled on-chain; this network has no native escrow.'
+        : 'Dispute resolved for the seller. The trade record is ready to settle; no funds move in this deployment.')
+    } else if (chainEnabled) {
+      notify('Delivery approved and the trade record settled on-chain; this network has no native escrow.')
+    } else {
+      notify('Delivery approved. The trade record is ready to settle; no funds move in this deployment.')
+    }
   }
 
   async function submitEvidence(event: React.FormEvent<HTMLFormElement>, trade: Trade) {
@@ -983,9 +1022,6 @@ function App() {
     const interval = String(form.get('interval'))
     const reference = evidenceFileSha256 ? `${interval} · SHA-256 ${evidenceFileSha256}` : interval
     try {
-      const chainTransactionHash = chainEnabled
-        ? await submitEvidenceOnChain(trade.id, await makeEvidenceHash({ tradeId: trade.id, quantity, source, intervalStart, intervalEnd, reference, evidenceFileSha256 }))
-        : undefined
       const submission = new FormData()
       submission.append('quantity', String(quantity))
       submission.append('source', source)
@@ -995,7 +1031,6 @@ function App() {
       if (file) submission.append('file', file)
       if (evidenceFileSha256) submission.append('evidenceFileSha256', evidenceFileSha256)
       if (aiEvidenceReview) submission.append('aiReviewId', aiEvidenceReview.id)
-      if (chainTransactionHash) submission.append('chainTransactionHash', chainTransactionHash)
       await apiUpload(`/api/trades/${encodeURIComponent(trade.id)}/evidence`, submission)
       await refreshFromApi()
     } catch (error) {
@@ -1006,7 +1041,7 @@ function App() {
     setAiEvidenceReview(null)
     setSelectedEvidence(null)
     setSelectedTrade(null)
-    notify('Evidence submitted for review. It has not been independently verified.')
+    notify('Delivery evidence submitted. The buyer must review it; uploading evidence does not send payment.')
   }
 
   async function downloadEvidenceFile(item: Evidence) {
@@ -1038,7 +1073,7 @@ function App() {
     try {
       const result = await apiUpload<{ data: EvidenceAiReview }>(`/api/trades/${encodeURIComponent(trade.id)}/evidence/ai-review`, form)
       setAiEvidenceReview(result.data)
-      notify('AI triage complete. A human verifier still decides whether evidence is acceptable.')
+      notify('AI triage complete. It is advisory; the buyer makes the delivery decision.')
     } catch (error) {
       notify(error instanceof Error ? error.message : 'AI evidence review failed.')
     } finally {
@@ -1091,7 +1126,7 @@ function App() {
           `Escrow this trade's USD ${totalUsd.toFixed(4)} equivalent?\n\n` +
           `Payment: ${quote.paymentEth} SepoliaETH\n` +
           `ETH/USD quote: $${quote.ethUsdPrice.toFixed(2)}\n\n` +
-          'MetaMask will ask you to approve the transaction. The ETH is held by the contract until evidence is approved, or refunded if it is rejected. This is testnet ETH with no real-world value.',
+          'MetaMask will ask you to approve the transaction. The contract holds the ETH until the buyer approves delivery or an authorized verifier resolves a dispute. This is testnet ETH with no real-world value.',
         )
         if (!approved) return
       }
@@ -1261,9 +1296,9 @@ function App() {
           <div className="page-heading">
             <div><div className="eyebrow"><span className="eyebrow-line" /> YOUR ENERGY, YOUR COMMUNITY</div><h1>{pageTitle}<span className="greeting-sun">✳</span></h1><p>{pageDescription[page]}</p></div>
             <div className="heading-actions">
-              <div className="role-switch"><span>Wallet role</span><b>{role}</b></div>
+              <div className="role-switch"><span>Marketplace role</span><b>{role}</b></div>
               {(page === 'Overview' || page === 'My offers' || page === 'My requests') && <button className="button button-primary" data-tour-target={page === 'My offers' ? 'offer-form' : page === 'My requests' ? 'request-form' : undefined} onClick={() => setModal('listing')}><Plus size={17} /> Create listing</button>}
-              {page === 'Solar projects' && ['Space owner', 'Admin'].includes(role) && <button className="button button-primary" onClick={() => setModal('project')}><Plus size={17} /> List a site</button>}
+              {page === 'Solar projects' && ['Project Owner', 'Admin'].includes(role) && <button className="button button-primary" onClick={() => setModal('project')}><Plus size={17} /> Create fundraiser</button>}
               {page === 'Energy market' && <button className="button button-primary" onClick={() => setModal('listing')}><Plus size={17} /> Create listing</button>}
             </div>
           </div>
@@ -1272,14 +1307,14 @@ function App() {
           {page === 'Energy market' && <Market listings={state.listings.filter((item) => item.status === 'Open')} marketTab={marketTab} setMarketTab={setMarketTab} onMatch={(listing) => { setSelectedListing(listing); setModal('match') }} query={query} setQuery={setQuery} onInfo={() => notify('Matching checks quantity, price limits, overlapping delivery windows and service area.')} />}
           {page === 'My offers' && <ListingPage title="Your active offers" listings={state.listings.filter((item) => item.type === 'offer' && item.isMine)} onCreate={() => setModal('listing')} onAction={updateListing} />}
           {page === 'My requests' && <ListingPage title="Your energy requests" listings={state.listings.filter((item) => item.type === 'request' && item.isMine)} onCreate={() => setModal('listing')} onAction={updateListing} />}
-          {page === 'Trades' && <Trades trades={filteredTrades} statusFilter={statusFilter} setStatusFilter={setStatusFilter} state={state} onSettle={settleTrade} onConfirm={confirmTrade} onCommit={commitTrade} chainEnabled={chainEnabled} onEvidence={(trade) => { setAiEvidenceReview(null); setSelectedTrade(trade); setSelectedEvidence(null); setModal('evidence') }} onCopy={copyText} />}
+          {page === 'Trades' && <Trades trades={filteredTrades} statusFilter={statusFilter} setStatusFilter={setStatusFilter} state={state} role={role} walletAddress={walletAddress} chainPaymentsEnabled={chainPaymentsEnabled} onSettle={settleTrade} onConfirm={confirmTrade} onCommit={commitTrade} onEvidence={(trade) => { setAiEvidenceReview(null); setSelectedTrade(trade); setSelectedEvidence(null); setModal('evidence') }} onReviewEvidence={(item) => { setAiEvidenceReview(null); setSelectedEvidence(item); setSelectedTrade(null); setModal('evidence') }} onCopy={copyText} />}
           {page === 'Evidence' && <EvidencePage evidence={state.evidence} role={role} onReview={(item) => { setAiEvidenceReview(null); setSelectedEvidence(item); setModal('evidence') }} onSelect={(item) => { setAiEvidenceReview(null); setSelectedEvidence(item); setModal('evidence') }} onDownload={(item) => { void downloadEvidenceFile(item) }} />}
           {page === 'Rewards' && <Rewards state={state} />}
-          {page === 'Solar projects' && <Projects projects={filteredProjects} contributions={state.contributions} filter={projectFilter} setFilter={setProjectFilter} onFund={(project) => { setSelectedProject(project); setModal('fund') }} onCreate={() => { if (['Space owner', 'Admin'].includes(role)) setModal('project'); else notify('Energy-host access is granted by the platform operator.') }} onOpen={setSolarWorkspaceId} workspaceId={solarWorkspaceId} onCloseWorkspace={() => setSolarWorkspaceId('')} role={role} identity={identity} mockApiEnabled={mockApiEnabled} onNotify={notify} onRefresh={refreshFromApi} />}
+          {page === 'Solar projects' && <Projects projects={filteredProjects} contributions={state.contributions} filter={projectFilter} setFilter={setProjectFilter} onFund={(project) => { setSelectedProject(project); setModal('fund') }} onCreate={() => { if (['Project Owner', 'Admin'].includes(role)) setModal('project'); else notify('Project Owner access is assigned by the platform operator.') }} onOpen={setSolarWorkspaceId} workspaceId={solarWorkspaceId} onCloseWorkspace={() => setSolarWorkspaceId('')} role={role} identity={identity} mockApiEnabled={mockApiEnabled} onNotify={notify} onRefresh={refreshFromApi} />}
           {page === 'Solar projects' && ['Verifier', 'Admin'].includes(role) && <SolarProjectReviewQueue projects={state.projects.filter((project) => project.status === 'Review')} onReview={(project, decision) => { void reviewSolarProject(project, decision) }} />}
           {page === 'Solar projects' && <SolarEstimateTransparency projects={filteredProjects} />}
           {page === 'Activity' && <ActivityPage activity={state.activity} onCopy={copyText} />}
-          {page === 'Settings' && <SettingsPage role={role} username={accountUsername} authMode={authMode === 'wallet' ? 'wallet' : 'password'} walletConnected={Boolean(walletAddress)} walletAddress={walletAddress} walletChainId={walletChainId} configuredChainId={configuredChainId} contractAddress={contractAddress} walletProviders={walletProviders} selectedWalletId={selectedWalletId} apiBusy={apiBusy} setSelectedWalletId={(id) => {
+          {page === 'Settings' && <SettingsPage role={role} username={accountUsername} authMode={authMode === 'wallet' ? 'wallet' : 'password'} walletConnected={Boolean(walletAddress)} walletAddress={walletAddress} walletChainId={walletChainId} configuredChainId={configuredChainId} contractAddress={contractAddress} walletProviders={walletProviders} selectedWalletId={selectedWalletId} apiBusy={apiBusy} onChangeRole={(value) => { void changeRole(value) }} setSelectedWalletId={(id) => {
             try {
               selectEvmWallet(id)
               setSelectedWalletId(id)
@@ -1308,6 +1343,7 @@ function App() {
         project={selectedProject}
         evidence={selectedEvidence}
         role={role}
+        chainPaymentsEnabled={chainPaymentsEnabled}
         onReview={reviewEvidence}
         onSettle={settleTrade}
         trade={selectedEvidence ? state.trades.find((item) => item.id === selectedEvidence.trade) : selectedTrade ?? undefined}
@@ -1495,13 +1531,13 @@ function Landing({ onExplore, onWallet, onPasswordAuth, displayName, setDisplayN
         {passwordMode === 'register' && <label>Display name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="Your name" minLength={2} maxLength={80} required /></label>}
         <label>Username<input autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} placeholder="3–30 letters, numbers, or underscores" minLength={3} maxLength={30} pattern="[A-Za-z0-9_]+" required /></label>
         <label>Password<input autoComplete={passwordMode === 'register' ? 'new-password' : 'current-password'} type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder={passwordMode === 'register' ? 'At least 12 characters' : 'Your password'} minLength={passwordMode === 'register' ? 12 : 1} maxLength={128} required /></label>
-        {passwordMode === 'register' && <label>Participation role<select value={walletRole} onChange={(event) => setWalletRole(event.target.value as 'prosumer' | 'consumer' | 'both' | 'funder')}><option value="consumer">Consumer · looking for clean energy</option><option value="prosumer">Prosumer · sharing generated energy</option><option value="both">Both · consume and share</option><option value="funder">Funder · follow community projects</option></select></label>}
+        {passwordMode === 'register' && <label>Participation role<select value={walletRole} onChange={(event) => setWalletRole(event.target.value as 'prosumer' | 'consumer' | 'both' | 'funder')}><option value="consumer">Energy Consumer · buy locally generated energy</option><option value="prosumer">Energy Producer · offer generated energy</option><option value="both">Producer & Consumer · buy and offer energy</option><option value="funder">Investor · register non-cash project interest</option></select></label>}
         <button className="button button-primary" disabled={busy} type="submit"><CheckCircle2 size={16} /> {busy ? 'Please wait…' : passwordMode === 'register' ? 'Create account' : 'Sign in'} <ArrowRight size={15} /></button>
         <small>Use a unique password. Passwords are stored as salted hashes. Password reset is not available because no recovery channel is configured.</small>
         {passwordMode === 'register' && <small>You can link a browser EVM wallet later in Settings. Until then, wallet-required marketplace and blockchain actions are unavailable.</small>}
       </form> : <form onSubmit={(event) => { event.preventDefault(); onWallet() }}>
         <label>Display name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="Your name" minLength={2} maxLength={80} required /></label>
-        <label>Participation role<select value={walletRole} onChange={(event) => setWalletRole(event.target.value as 'prosumer' | 'consumer' | 'both' | 'funder')}><option value="consumer">Consumer · looking for clean energy</option><option value="prosumer">Prosumer · sharing generated energy</option><option value="both">Both · consume and share</option><option value="funder">Funder · follow community projects</option></select></label>
+        <label>Participation role<select value={walletRole} onChange={(event) => setWalletRole(event.target.value as 'prosumer' | 'consumer' | 'both' | 'funder')}><option value="consumer">Energy Consumer · buy locally generated energy</option><option value="prosumer">Energy Producer · offer generated energy</option><option value="both">Producer & Consumer · buy and offer energy</option><option value="funder">Investor · register non-cash project interest</option></select></label>
         <label>Browser EVM wallet<select value={selectedWalletId} onChange={(event) => setSelectedWalletId(event.target.value)} required>
           {walletProviders.length === 0 && <option value="">No wallet detected</option>}
           {walletProviders.map((wallet) => <option key={wallet.id} value={wallet.id}>{wallet.name}</option>)}
@@ -1511,7 +1547,7 @@ function Landing({ onExplore, onWallet, onPasswordAuth, displayName, setDisplayN
         <small>Bright Ledger only requests a signature; it never asks for your seed phrase or private key. Compatible injected EVM wallets include Trust Wallet and Phantom’s EVM mode. Solana-only Phantom requires separate support.</small>
       </form>}
     </div></section>
-    <footer className="landing-footer"><Logo compact /><span>Clean energy. Real value.</span><span>Energy delivery, payments, and environmental claims require independent verification.</span><button onClick={onExplore}>Enter marketplace <ArrowRight size={14} /></button></footer>
+    <footer className="landing-footer"><Logo compact /><span>The Future of Energy</span><span>Energy delivery, payments, and environmental claims require independent verification.</span><button onClick={onExplore}>Enter marketplace <ArrowRight size={14} /></button></footer>
   </main>
 }
 
@@ -1565,10 +1601,66 @@ function ListingPage({ title, listings, onCreate, onAction }: { title: string; l
   return <div className="page-stack"><section className="panel list-page-panel"><div className="panel-heading"><div><span className="section-kicker">YOUR LISTINGS</span><h2>{title}</h2><p>Manage availability in the shared marketplace.</p></div><button className="button button-primary" onClick={onCreate}><Plus size={16} /> Create listing</button></div>{listings.length === 0 ? <div className="empty-state"><Bolt size={26} /><h3>Nothing here just yet</h3><p>Publish your first energy listing to get started.</p><button className="button button-primary" onClick={onCreate}><Plus size={16} /> Create listing</button></div> : <div className="responsive-table"><table className="data-table"><thead><tr><th>Listing</th><th>Quantity</th><th>Price / kWh</th><th>Location</th><th>Delivery window</th><th>Status</th><th>Actions</th></tr></thead><tbody>{listings.map((item) => <tr key={item.id}><td><b>{item.id}</b><small>{item.source}</small></td><td>{item.quantity} kWh</td><td>${item.price.toFixed(2)}</td><td>{item.area}</td><td>{item.window}</td><td><Status status={item.status} /></td><td>{item.status === 'Open' ? <button className="table-action" onClick={() => onAction(item, 'pause')}>Pause</button> : item.status === 'Paused' ? <button className="table-action" onClick={() => onAction(item, 'resume')}>Resume</button> : <span className="muted-cell">Unavailable</span>}{['Open', 'Paused'].includes(item.status) && <button className="table-action" onClick={() => onAction(item, 'cancel')}>Cancel</button>}</td></tr>)}</tbody></table></div>}</section><div className="helper-note"><CircleHelp size={16} /><span>Marketplace actions coordinate records only. They do not deliver electricity or process payments.</span></div></div>
 }
 
-function Trades({ trades, statusFilter, setStatusFilter, state, onSettle, onConfirm, onCommit, chainEnabled, onEvidence, onCopy }: { trades: Trade[]; statusFilter: string; setStatusFilter: (value: string) => void; state: AppState; onSettle: (trade: Trade) => void; onConfirm: (trade: Trade) => void; onCommit: (trade: Trade) => void; chainEnabled: boolean; onEvidence: (trade: Trade) => void; onCopy: (text: string) => void }) {
-  return <div className="page-stack"><div className="trade-summary-cards" data-tour-target="trades"><div className="mini-stat"><span>All trades</span><b>{state.trades.length.toString().padStart(2, '0')}</b><small>Across your account</small></div><div className="mini-stat"><span>In progress</span><b>{state.trades.filter((trade) => trade.status !== 'Settled').length.toString().padStart(2, '0')}</b><small>Awaiting next action</small></div><div className="mini-stat"><span>Energy exchanged</span><b>{state.trades.filter((trade) => trade.status === 'Settled').reduce((sum, trade) => sum + trade.quantity, 0).toFixed(1)} <em>kWh</em></b><small>Settled records</small></div></div><section className="panel list-page-panel"><div className="panel-heading"><div><span className="section-kicker">AUDITABLE BY DESIGN</span><h2>Trade activity</h2><p>Every match has a clear status and next step.</p></div><div className="filter-select-wrap"><Filter size={14} /><select aria-label="Filter trades by status" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option>All status</option><option>Evidence needed</option><option>Under review</option><option>Ready to settle</option><option>Awaiting confirmation</option><option>Settled</option><option>Disputed</option></select><ChevronDown size={13} /></div></div>{trades.length === 0 ? <div className="empty-state"><Activity size={26} /><h3>No trades match this view</h3><p>Change the filter to see your market activity.</p></div> : <div className="responsive-table"><table className="data-table"><thead><tr><th>Trade ID</th><th>Participants</th><th>Energy</th><th>Unit price</th><th>Last update</th><th>Status</th><th>Next step</th></tr></thead><tbody>{trades.map((trade) => <tr key={trade.id}><td><b>{trade.id}</b><small><button className="hash-copy" onClick={() => onCopy(trade.hash)}><Copy size={11} /> {trade.hash}</button></small></td><td><span className="participants">{trade.buyer}<small>↔</small>{trade.seller}</span></td><td><b>{trade.quantity} kWh</b></td><td>${trade.price.toFixed(2)}</td><td>{trade.time}</td><td><Status status={trade.status} /></td><td>{trade.status === 'Ready to settle' ? <button className="table-action" onClick={() => onSettle(trade)}>Settle <ArrowRight size={13} /></button> : trade.status === 'Evidence needed' && chainEnabled && trade.hash === 'Not submitted' ? trade.buyerWalletAddress && trade.sellerWalletAddress ? <button className="table-action" onClick={() => onCommit(trade)}>Commit on-chain <ArrowRight size={13} /></button> : <span className="muted-cell">Participant wallets needed</span> : trade.status === 'Evidence needed' ? <button className="table-action" onClick={() => onEvidence(trade)}>Add evidence <ArrowRight size={13} /></button> : trade.status === 'Awaiting confirmation' ? <button className="table-action" onClick={() => onConfirm(trade)}>Confirm trade <ArrowRight size={13} /></button> : trade.status === 'Settled' ? <span className="muted-cell">Complete <Check size={14} /></span> : <span className="muted-cell">In progress <Clock3 size={14} /></span>}</td></tr>)}</tbody></table></div>}
-      <div className="trade-flow"><span className="flow-step active"><i>1</i>Match proposed</span><span className="flow-connector" /><span className="flow-step active"><i>2</i>Commitment</span><span className="flow-connector" /><span className="flow-step"><i>3</i>Evidence review</span><span className="flow-connector" /><span className="flow-step"><i>4</i>Settlement</span></div>
-    </section><div className="helper-note"><ShieldCheck size={16} /><span>Transaction hashes reflect configured chain records. Submitted, confirmed and settled are different states.</span></div></div>
+function Trades({ trades, statusFilter, setStatusFilter, state, role, walletAddress, chainPaymentsEnabled, onSettle, onConfirm, onCommit, onEvidence, onReviewEvidence, onCopy }: {
+  trades: Trade[]
+  statusFilter: string
+  setStatusFilter: (value: string) => void
+  state: AppState
+  role: Role
+  walletAddress: string
+  chainPaymentsEnabled: boolean
+  onSettle: (trade: Trade) => void
+  onConfirm: (trade: Trade) => void
+  onCommit: (trade: Trade) => void
+  onEvidence: (trade: Trade) => void
+  onReviewEvidence: (item: Evidence) => void
+  onCopy: (text: string) => void
+}) {
+  function nextStep(trade: Trade) {
+    const isBuyer = Boolean(walletAddress && trade.buyerWalletAddress?.toLowerCase() === walletAddress.toLowerCase())
+    const isSeller = Boolean(walletAddress && trade.sellerWalletAddress?.toLowerCase() === walletAddress.toLowerCase())
+    const evidence = state.evidence.find((item) => item.trade === trade.id)
+    if (trade.status === 'Awaiting confirmation') return trade.hasConfirmed
+      ? <span className="muted-cell">Waiting for the other participant</span>
+      : <button className="table-action" onClick={() => onConfirm(trade)}>Confirm terms <ArrowRight size={13} /></button>
+    if (trade.status === 'Awaiting buyer escrow') {
+      if (!isBuyer) return <span className="muted-cell">Waiting for buyer to fund escrow</span>
+      if (!trade.buyerWalletAddress || !trade.sellerWalletAddress) return <span className="muted-cell">Both wallets are required</span>
+      return <button className="table-action" onClick={() => onCommit(trade)}>{chainPaymentsEnabled ? 'Fund Sepolia escrow' : 'Record commitment'} <ArrowRight size={13} /></button>
+    }
+    if (trade.status === 'Evidence needed') {
+      if (isSeller) return <button className="table-action" onClick={() => onEvidence(trade)}>Submit delivery evidence <ArrowRight size={13} /></button>
+      return <span className="muted-cell">Waiting for seller evidence</span>
+    }
+    if (trade.status === 'Under review' && evidence?.status === 'Pending') {
+      if (evidence.buyerCanReview && isBuyer) return <button className="table-action" onClick={() => onReviewEvidence(evidence)}>Review delivery <ArrowRight size={13} /></button>
+      return <span className="muted-cell">Waiting for buyer review</span>
+    }
+    if (trade.status === 'Disputed' && evidence?.status === 'Disputed' && ['Verifier', 'Admin'].includes(role)) {
+      return <button className="table-action" onClick={() => onReviewEvidence(evidence)}>Resolve dispute <ArrowRight size={13} /></button>
+    }
+    if (trade.status === 'Ready to settle') return <button className="table-action" onClick={() => onSettle(trade)}>Settle <ArrowRight size={13} /></button>
+    if (trade.status === 'Settled' || trade.status === 'Refunded' || trade.status === 'Cancelled') return <span className="muted-cell">Complete <Check size={14} /></span>
+    return <span className="muted-cell">In progress <Clock3 size={14} /></span>
+  }
+
+  return <div className="page-stack">
+    <div className="trade-summary-cards" data-tour-target="trades">
+      <div className="mini-stat"><span>All trades</span><b>{state.trades.length.toString().padStart(2, '0')}</b><small>Across your account</small></div>
+      <div className="mini-stat"><span>In progress</span><b>{state.trades.filter((trade) => !['Settled', 'Refunded', 'Cancelled'].includes(trade.status)).length.toString().padStart(2, '0')}</b><small>Awaiting next action</small></div>
+      <div className="mini-stat"><span>Energy exchanged</span><b>{state.trades.filter((trade) => trade.status === 'Settled').reduce((sum, trade) => sum + trade.quantity, 0).toFixed(1)} <em>kWh</em></b><small>Settled records</small></div>
+    </div>
+    <section className="panel list-page-panel">
+      <div className="panel-heading"><div><span className="section-kicker">AUDITABLE BY DESIGN</span><h2>Trade activity</h2><p>Buyer funds escrow; seller submits delivery evidence; buyer approves release or opens a dispute.</p></div>
+        <div className="filter-select-wrap"><Filter size={14} /><select aria-label="Filter trades by status" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option>All status</option><option>Awaiting confirmation</option><option>Awaiting buyer escrow</option><option>Evidence needed</option><option>Under review</option><option>Ready to settle</option><option>Disputed</option><option>Settled</option><option>Refunded</option></select><ChevronDown size={13} /></div>
+      </div>
+      {trades.length === 0
+        ? <div className="empty-state"><Activity size={26} /><h3>No trades match this view</h3><p>Change the filter to see your market activity.</p></div>
+        : <div className="responsive-table"><table className="data-table"><thead><tr><th>Trade ID</th><th>Participants</th><th>Energy</th><th>Unit price</th><th>Last update</th><th>Status</th><th>Next step</th></tr></thead><tbody>{trades.map((trade) => <tr key={trade.id}><td><b>{trade.id}</b><small><button className="hash-copy" onClick={() => onCopy(trade.hash)}><Copy size={11} /> {trade.hash}</button></small></td><td><span className="participants">{trade.buyer}<small>↔</small>{trade.seller}</span></td><td><b>{trade.quantity} kWh</b></td><td>${trade.price.toFixed(2)}</td><td>{trade.time}</td><td><Status status={trade.status} /></td><td>{nextStep(trade)}</td></tr>)}</tbody></table></div>}
+      <div className="trade-flow"><span className="flow-step active"><i>1</i>Confirm terms</span><span className="flow-connector" /><span className="flow-step active"><i>2</i>{chainPaymentsEnabled ? 'Buyer funds escrow' : 'Buyer commitment'}</span><span className="flow-connector" /><span className="flow-step"><i>3</i>Seller delivers</span><span className="flow-connector" /><span className="flow-step"><i>4</i>Buyer approves / disputes</span></div>
+    </section>
+    <div className="helper-note"><ShieldCheck size={16} /><span>{chainPaymentsEnabled ? 'Only the buyer sends Sepolia escrow. Delivery evidence is not a payment transaction; a dispute keeps escrow locked.' : 'This deployment records trade decisions without moving funds. Delivery evidence is never a payment transaction.'}</span></div>
+  </div>
 }
 
 function EvidencePage({ evidence, role, onReview, onSelect, onDownload }: { evidence: Evidence[]; role: Role; onReview: (item: Evidence) => void; onSelect: (item: Evidence) => void; onDownload: (item: Evidence) => void }) {
@@ -1580,8 +1672,10 @@ function EvidencePage({ evidence, role, onReview, onSelect, onDownload }: { evid
       {item.evidenceFileSha256 && <div className="evidence-file-hash">Attached file SHA-256: <code>{item.evidenceFileSha256}</code></div>}
       {item.evidenceFileAvailable && <button className="text-link evidence-download" onClick={() => onDownload(item)}><Download size={14} /> Download attached evidence</button>}
       {item.aiReview && <div className="evidence-ai-summary"><b>AI triage · {item.aiReview.analysis.confidence} confidence</b><span>{item.aiReview.analysis.summary}</span><small>{item.aiReview.model} · advisory only</small></div>}
-      {item.status === 'Rejected' && item.reason && <div className="rejection-reason">Review note: {item.reason}</div>}
-      <div className="evidence-card-foot"><button className="text-link" onClick={() => onSelect(item)}>View reading details <ArrowRight size={14} /></button>{item.status === 'Pending' && <div className="evidence-actions">{(role === 'Verifier' || role === 'Admin') ? <><button className="button button-secondary" onClick={() => onReview(item)}>Review record</button><button className="button button-approve" onClick={() => onReview(item)}><Check size={15} /> Approve evidence</button></> : <span className="permission-note"><ShieldCheck size={14} /> Reviewer role required</span>}</div>}</div>
+      {item.reason && <div className="rejection-reason">{item.status === 'Disputed' ? 'Buyer dispute reason' : 'Review note'}: {item.reason}</div>}
+      <div className="evidence-card-foot"><button className="text-link" onClick={() => onSelect(item)}>View reading details <ArrowRight size={14} /></button>      {(item.status === 'Pending' && item.buyerCanReview) || (item.status === 'Disputed' && ['Verifier', 'Admin'].includes(role))
+        ? <div className="evidence-actions"><button className="button button-secondary" onClick={() => onReview(item)}>{item.status === 'Disputed' ? 'Resolve dispute' : 'Review delivery'}</button></div>
+        : item.status === 'Pending' && <span className="permission-note"><ShieldCheck size={14} /> Waiting for the buyer to review</span>}</div>
     </article>)}</div>
   </div>
 }
@@ -1684,11 +1778,11 @@ function SolarProjectWorkspace({ projectId, role, identity, onClose, onNotify, o
   const { project, site, funding, generation, market, attributes, settlements, milestones, timeline, disputes, impact } = workspace
   const openDispute = disputes.find((dispute) => dispute.status === 'OPEN')
   return <section className="panel solar-workspace">
-    <div className="solar-workspace-heading"><div><span className="section-kicker">PROJECT WORKSPACE · {project.id}</span><h2>{project.name}</h2><p>{site?.publicLocation ?? 'Location withheld'} · {site?.roofType ?? 'Solar site'} · <Status status={project.status} /></p></div><div className="solar-workspace-heading-actions"><button className="button button-outline" onClick={() => void exportReport()}><Download size={14} /> Export records</button><button className="icon-button" aria-label="Close project details" onClick={onClose}><X size={18} /></button></div></div>
-    <div className="solar-workspace-banner"><ShieldCheck size={16} /><span>Prototype workspace: contributions, readings, estimates, attributes and settlement records are simulated, held in memory, and reset when the mock API restarts.</span></div>
+    <div className="solar-workspace-heading"><div><span className="section-kicker">FUNDRAISING PROJECT · {project.id}</span><h2>{project.name}</h2><p>{site?.publicLocation ?? 'Location withheld'} · {site?.roofType ?? 'Solar site'} · <Status status={project.status} /></p></div><div className="solar-workspace-heading-actions"><button className="button button-outline" onClick={() => void exportReport()}><Download size={14} /> Export records</button><button className="icon-button" aria-label="Close project details" onClick={onClose}><X size={18} /></button></div></div>
+    <div className="solar-workspace-banner"><ShieldCheck size={16} /><span>Prototype records only: investor contributions, readings, estimates and settlements are simulated. No funds are collected or distributed.</span></div>
     {error && <p role="alert" className="solar-workspace-error">{error}</p>}
     <div className="solar-workspace-metrics">
-      <div><span>Funding received</span><b>{formatUSD(funding.receivedMinor / 100)}</b><small>of {formatUSD(funding.targetMinor / 100)}</small></div>
+      <div><span>Contributions recorded</span><b>{formatUSD(funding.receivedMinor / 100)}</b><small>of {formatUSD(funding.targetMinor / 100)} goal</small></div>
       <div><span>Verified generation</span><b>{(generation.verifiedWh / 1000).toLocaleString()} kWh</b><small>{generation.batches.length} submitted records</small></div>
       <div><span>Unallocated energy</span><b>{(generation.availableWh / 1000).toLocaleString()} kWh</b><small>Verified records only</small></div>
       <div><span>Illustrative impact</span><b>{impact.estimatedKgCo2e.toLocaleString()} kg CO₂e</b><small>Not independently verified</small></div>
@@ -1699,10 +1793,10 @@ function SolarProjectWorkspace({ projectId, role, identity, onClose, onNotify, o
           {site.estimate && <div className="solar-estimate-card"><b>{site.estimate.capacityKwp} kWp estimated capacity</b><span>{site.estimate.dailyKwh} kWh/day · {site.estimate.monthlyKwh} kWh/month · {formatUSD(site.estimate.capexMinor / 100)} indicative capex</span><small>{site.estimate.methodologyVersion} · {site.estimate.assumptions.note}</small></div>}
           {canVerify && ['SUBMITTED', 'UNDER_REVIEW', 'NEEDS_CHANGES'].includes(site.reviewStatus) && <div className="solar-action-row"><button className="button button-approve" disabled={busy} onClick={() => void mutate(`/api/solar/sites/${encodeURIComponent(site.id)}/review`, { decision: 'APPROVED' }, 'Site approved in the prototype workflow.')}>Approve site</button><button className="button button-danger-outline" disabled={busy} onClick={() => void mutate(`/api/solar/sites/${encodeURIComponent(site.id)}/review`, { decision: 'NEEDS_CHANGES', reason: 'Additional evidence requested by reviewer.' }, 'Site returned for additional information.')}>Request changes</button></div>}
         </>}
-        {site?.reviewStatus === 'APPROVED' && ['Review', 'Draft'].includes(project.status) && mayManage && <button className="button button-primary solar-full-button" disabled={busy} onClick={() => void mutate(`${projectPath}/publish`, {}, 'Project published; simulated funding is now open.')}>Publish project for funding <ArrowRight size={14} /></button>}
+        {site?.reviewStatus === 'APPROVED' && ['Review', 'Draft'].includes(project.status) && mayManage && <button className="button button-primary solar-full-button" disabled={busy} onClick={() => void mutate(`${projectPath}/publish`, {}, 'Fundraising page published; simulated contributions are now open.')}>Publish fundraising page <ArrowRight size={14} /></button>}
       </article>
-      <article className="solar-workspace-section"><div className="solar-section-title"><div><span className="section-kicker">COMMUNITY FUNDING</span><h3>Contributions & receipts</h3></div><span className="solar-count">{funding.contributions.length} records</span></div>
-        <div className="solar-workspace-progress"><div className="funding-progress-head"><span>Funding goal</span><b>{pct(funding.receivedMinor, funding.targetMinor)}%</b></div><div className="progress-track"><i style={{ width: `${pct(funding.receivedMinor, funding.targetMinor)}%` }} /></div><span>{formatUSD(funding.remainingMinor / 100)} remaining · {funding.currency}</span></div>
+      <article className="solar-workspace-section"><div className="solar-section-title"><div><span className="section-kicker">INVESTOR INTEREST · SIMULATED</span><h3>Contributions & receipts</h3></div><span className="solar-count">{funding.contributions.length} records</span></div>
+        <div className="solar-workspace-progress"><div className="funding-progress-head"><span>Fundraising goal</span><b>{pct(funding.receivedMinor, funding.targetMinor)}%</b></div><div className="progress-track"><i style={{ width: `${pct(funding.receivedMinor, funding.targetMinor)}%` }} /></div><span>{formatUSD(funding.remainingMinor / 100)} remaining · {funding.currency}</span></div>
         {mayManage && project.status === 'Funding' && <button className="button button-outline solar-full-button" disabled={busy} onClick={() => { if (window.confirm('Close this funding round? The API will complete it at target or mark it failed and record simulated refunds.')) void mutate(`${projectPath}/close-funding`, {}, 'Funding round closed and its result recorded.') }}>Close funding round</button>}
         {funding.contributions.length ? <div className="solar-record-list">{funding.contributions.map((item) => <div key={item.id}><span><b>{item.contributor}</b><small>{item.id} · {item.status}</small></span><b>{formatUSD(item.amountMinor / 100)}</b><button className="table-action" onClick={async () => { try { const receipt = await apiGet<{ data: Record<string, unknown> }>(`/api/solar/contributions/${encodeURIComponent(item.id)}/receipt`); await navigator.clipboard.writeText(JSON.stringify(receipt.data, null, 2)); onNotify('Contribution receipt copied.') } catch (receiptError) { onNotify(receiptError instanceof Error ? receiptError.message : 'Could not retrieve receipt.') } }}>Receipt</button></div>)}</div> : <p className="solar-empty-note">No contribution records yet.</p>}
       </article>
@@ -1717,7 +1811,7 @@ function SolarProjectWorkspace({ projectId, role, identity, onClose, onNotify, o
         <div className="solar-record-list">{market.trades.map((trade) => <div className="solar-trade-row" key={trade.id}><span><b>{trade.id} · {(trade.energyWh / 1000).toLocaleString()} kWh</b><small>{trade.generationBatchId} · ${ (trade.priceMinorPerKwh / 100).toFixed(2)}/kWh · {trade.status}</small></span><b>{formatUSD(trade.grossAmountMinor / 100)}</b></div>)}</div>
       </article>
       <article className="solar-workspace-section"><div className="solar-section-title"><div><span className="section-kicker">SETTLEMENT & ALLOCATION</span><h3>Settlement waterfall</h3></div><span className="solar-count">{settlements.length} finalized</span></div>
-        <p className="solar-helper-copy">Review settlement records in integer USD cents. Allocation terms: funders {project.allocationRules.funderPct}% · owner {project.allocationRules.ownerPct}% · operator {project.allocationRules.operatorPct}%.</p>
+        <p className="solar-helper-copy">Review settlement records in integer USD cents. Allocation terms: Investors {project.allocationRules.funderPct}% · Project Owner {project.allocationRules.ownerPct}% · operator {project.allocationRules.operatorPct}%.</p>
         {market.trades.map((trade) => <div className="solar-trade-row" key={trade.id}><span><b>{trade.id}</b><small>{(trade.energyWh / 1000).toLocaleString()} kWh · {trade.status}</small></span><b>{formatUSD(trade.grossAmountMinor / 100)}</b></div>)}
         <button className="button button-outline solar-full-button" disabled={busy || !canVerify} onClick={() => void previewSettlement()}>{canVerify ? 'Calculate settlement preview' : 'Verifier role required'}</button>
         {preview && <div className="solar-estimate-card settlement-preview"><b>Distributable: {formatUSD(preview.distributablePoolMinor / 100)}</b>{preview.allocations.map((allocation, index) => <span key={`${allocation.recipient}-${index}`}>{allocation.type} · {allocation.recipient}: {formatUSD(allocation.amountMinor / 100)}</span>)}<small>Input {preview.inputHash} · Output {preview.outputHash}</small><button className="button button-primary" disabled={busy || !canVerify} onClick={() => void mutate(`${projectPath}/settlement-runs`, preview, 'Settlement finalized with validated allocations.')}>Finalize settlement</button></div>}
@@ -1748,23 +1842,44 @@ function SolarProjectReviewQueue({ projects, onReview }: {
   onReview: (project: Project, decision: 'approve' | 'reject') => void
 }) {
   if (!projects.length) return null
-  return <section className="panel list-page-panel"><div className="panel-heading"><div><span className="section-kicker">OPERATOR REVIEW</span><h2>Solar sites awaiting review</h2><p>Approval opens non-cash community pledges; it does not verify project costs or guarantee returns.</p></div></div><div className="solar-record-list">{projects.map((project) => <div key={project.id}><span><b>{project.name}</b><small>{project.id} · {project.location} · {project.permission}</small></span><button className="button button-danger-outline" onClick={() => onReview(project, 'reject')}>Reject</button><button className="button button-approve" onClick={() => onReview(project, 'approve')}>Approve</button></div>)}</div></section>
+  return <section className="panel list-page-panel"><div className="panel-heading"><div><span className="section-kicker">PROJECT REVIEW</span><h2>Fundraising projects awaiting review</h2><p>Approval allows a Project Owner to publish the fundraising page. It does not verify project costs or guarantee returns.</p></div></div><div className="solar-record-list">{projects.map((project) => <div key={project.id}><span><b>{project.name}</b><small>{project.id} · {project.location} · {project.permission}</small></span><button className="button button-danger-outline" onClick={() => onReview(project, 'reject')}>Reject</button><button className="button button-approve" onClick={() => onReview(project, 'approve')}>Approve</button></div>)}</div></section>
 }
 
 function SolarEstimateTransparency({ projects }: { projects: Project[] }) {
   if (!projects.length) return null
-  return <section className="panel list-page-panel"><div className="panel-heading"><div><span className="section-kicker">ESTIMATE PROVENANCE</span><h2>Funding assumptions & AI review</h2><p>Every listed site is linked to an input-grounded estimate and a completed advisory review.</p></div></div><div className="solar-record-list">{projects.map((project) => <div key={project.id}><span><b>{project.name} · {project.estimateReviewConfidence} confidence</b><small>{project.fundingMethodology} · reviewed by {project.estimateModel}</small><small>{project.estimateReviewSummary}</small><small>{project.estimateLimitation}</small></span></div>)}</div></section>
+  return <section className="panel list-page-panel"><div className="panel-heading"><div><span className="section-kicker">ESTIMATE PROVENANCE</span><h2>Project costs & AI assessment</h2><p>Each published project includes a cost-based estimate and an advisory AI assessment.</p></div></div><div className="solar-record-list">{projects.map((project) => <div key={project.id}><span><b>{project.name} · {project.estimateReviewConfidence} confidence</b><small>{project.fundingMethodology} · assessed by {project.estimateModel}</small><small>{project.estimateReviewSummary}</small><small>{project.estimateLimitation}</small></span></div>)}</div></section>
 }
 
 function Projects({ projects, contributions, filter, setFilter, onFund, onCreate, onOpen, workspaceId, onCloseWorkspace, role, identity, mockApiEnabled, onNotify, onRefresh }: { projects: Project[]; contributions: Contribution[]; filter: string; setFilter: (value: string) => void; onFund: (project: Project) => void; onCreate: () => void; onOpen: (projectId: string) => void; workspaceId: string; onCloseWorkspace: () => void; role: Role; identity: string; mockApiEnabled: boolean; onNotify: (message: string) => void; onRefresh: () => Promise<void> }) {
-  return <div className="page-stack"><section className="solar-intro"><div><span className="section-kicker">COMMUNITY SOLAR · SIMULATED FUNDING</span><h2>Great roofs can<br />build brighter futures.</h2><p>Connect solar-ready spaces with community funders. Every number here is illustrative—no investment or payment takes place.</p><button className="button button-primary" data-tour-target="projects" onClick={onCreate}><Plus size={16} /> List a solar-ready site</button></div><div className="solar-intro-art"><img src="/images/solarfield.jpg" alt="A field of solar panels under clear skies" /></div></section>  <div className="solar-toolbar"><div><b>Solar projects</b><span> · {projects.length} opportunities</span></div><div className="filter-select-wrap"><Filter size={14} /><select aria-label="Filter solar projects" value={filter} onChange={(event) => setFilter(event.target.value)}><option>All projects</option><option>Funding</option><option>Operational</option><option>Review</option></select><ChevronDown size={13} /></div></div>{projects.length === 0 ? <div className="empty-state"><Sun size={26} /><h3>No projects found</h3><p>Projects appear after an input-grounded funding estimate is completed and a site is submitted.</p></div> : <div className="project-grid">{projects.map((project, index) => <article className="project-card" key={project.id}><div className={`project-cover ${project.image}`}><img src={`/images/${['rooftop.jpg', 'rooftop_3.jpg', 'solarfield.jpg'][index % 3]}`} alt={`${project.name} solar project site`} /><span className="project-id">{project.id}</span><span className="project-cover-tag">COMMUNITY SOLAR</span></div><div className="project-card-body"><div className="project-location"><span><Sun size={13} /> {project.location}</span><Status status={project.status} /></div><h3>{project.name}</h3><p title={project.notes}>Site listed by {project.owner} · {project.siteType}</p><span className="project-permission"><ShieldCheck size={12} /> {project.permission}</span><div className="project-metrics"><div><span>Est. capacity</span><b>{project.capacity} <small>kW</small></b></div><div><span>Available area</span><b>{project.area} <small>m²</small></b></div><div><span>Funding target</span><b>{formatUSD(project.target)}</b></div></div><div className="funding-progress-head"><span>Non-cash pledges · {contributions.filter((item) => item.projectId === project.id).length} records from your account</span><b>{pct(project.raised, project.target)}%</b></div><div className="progress-track"><i style={{ width: `${pct(project.raised, project.target)}%` }} /></div><div className="funding-amount"><span>{formatUSD(project.raised)} <small>pledged</small></span><span>{formatUSD(project.target - project.raised)} <small>remaining</small></span></div><button className="button button-secondary project-action" disabled={project.status !== 'Funding'} onClick={() => onFund(project)}>{project.status === 'Review' || project.status === 'Draft' ? 'Awaiting site approval / publication' : project.raised >= project.target ? 'Pledge target reached' : project.status === 'Funding' ? 'Record a pledge' : 'Pledging unavailable'} <ArrowRight size={15} /></button>{mockApiEnabled && <button className="button button-outline project-action" onClick={() => onOpen(project.id)}>Open project workspace <ArrowRight size={15} /></button>}</div></article>)}</div>}{mockApiEnabled && workspaceId && <SolarProjectWorkspace key={workspaceId} projectId={workspaceId} role={role} identity={identity} onClose={onCloseWorkspace} onNotify={onNotify} onRefresh={onRefresh} />}<div className="solar-disclaimer"><ShieldCheck size={15} /><span>Capacity and funding estimates depend on user-entered assumptions. Pledges do not move money or represent investments; no returns or payouts are supported. Solar estimates are not engineering guarantees.</span></div></div>
+  return <div className="page-stack">
+    <section className="solar-intro">
+      <div><span className="section-kicker">COMMUNITY SOLAR · FUNDRAISING</span><h2>Bring a solar project<br />to the community.</h2><p>Project Owners present a solar site and funding goal. Investors can register interest; all contributions shown here are simulated and no money is transferred.</p><button className="button button-primary" data-tour-target="projects" onClick={onCreate}><Plus size={16} /> Create a fundraiser</button></div>
+      <div className="solar-intro-art"><img src="/images/solarfield.jpg" alt="A field of solar panels under clear skies" /></div>
+    </section>
+    <div className="solar-toolbar"><div><b>Community solar projects</b><span> · {projects.length} opportunities</span></div><div className="filter-select-wrap"><Filter size={14} /><select aria-label="Filter solar projects" value={filter} onChange={(event) => setFilter(event.target.value)}><option>All projects</option><option>Funding</option><option>Operational</option><option>Review</option></select><ChevronDown size={13} /></div></div>
+    {projects.length === 0
+      ? <div className="empty-state"><Sun size={26} /><h3>No projects found</h3><p>Projects appear after a Project Owner submits a cost-based funding estimate and project details for review.</p></div>
+      : <div className="project-grid">{projects.map((project, index) => <article className="project-card" key={project.id}>
+        <div className={`project-cover ${project.image}`}><img src={`/images/${['rooftop.jpg', 'rooftop_3.jpg', 'solarfield.jpg'][index % 3]}`} alt={`${project.name} solar project site`} /><span className="project-id">{project.id}</span><span className="project-cover-tag">COMMUNITY SOLAR</span></div>
+        <div className="project-card-body"><div className="project-location"><span><Sun size={13} /> {project.location}</span><Status status={project.status} /></div>
+          <h3>{project.name}</h3><p title={project.notes}>Project Owner: {project.owner} · {project.siteType}</p><span className="project-permission"><ShieldCheck size={12} /> {project.permission}</span>
+          <div className="project-metrics"><div><span>Estimated capacity</span><b>{project.capacity} <small>kW</small></b></div><div><span>Available area</span><b>{project.area} <small>m²</small></b></div><div><span>Funding goal</span><b>{formatUSD(project.target)}</b></div></div>
+          <div className="funding-progress-head"><span>Your recorded interests · {contributions.filter((item) => item.projectId === project.id).length}</span><b>{pct(project.raised, project.target)}%</b></div><div className="progress-track"><i style={{ width: `${pct(project.raised, project.target)}%` }} /></div>
+          <div className="funding-amount"><span>{formatUSD(project.raised)} <small>contributed</small></span><span>{formatUSD(project.target - project.raised)} <small>remaining</small></span></div>
+          <button className="button button-secondary project-action" disabled={project.status !== 'Funding'} onClick={() => onFund(project)}>{project.status === 'Review' || project.status === 'Draft' ? 'Awaiting project approval' : project.raised >= project.target ? 'Funding goal reached' : project.status === 'Funding' ? 'Register investor interest' : 'Funding unavailable'} <ArrowRight size={15} /></button>
+          {mockApiEnabled && <button className="button button-outline project-action" onClick={() => onOpen(project.id)}>Open project workspace <ArrowRight size={15} /></button>}
+        </div>
+      </article>)}</div>}
+    {mockApiEnabled && workspaceId && <SolarProjectWorkspace key={workspaceId} projectId={workspaceId} role={role} identity={identity} onClose={onCloseWorkspace} onNotify={onNotify} onRefresh={onRefresh} />}
+    <div className="solar-disclaimer"><ShieldCheck size={15} /><span>Investor interest is a simulated, non-cash contribution—not an investment or funding commitment. Cost and capacity estimates use user-entered assumptions; returns are not offered or promised.</span></div>
+  </div>
 }
 
 function ActivityPage({ activity, onCopy }: { activity: AppState['activity']; onCopy: (text: string) => void }) {
   return <div className="page-stack"><section className="panel list-page-panel"><div className="panel-heading"><div><span className="section-kicker">TRANSPARENT BY DEFAULT</span><h2>Activity & audit trail</h2><p>Application events are shown separately from any simulated chain references.</p></div><button className="button button-outline" onClick={() => onCopy(JSON.stringify(activity, null, 2))}><Download size={15} /> Copy report</button></div><div className="timeline-list">{activity.map((event, index) => <div className="timeline-item" key={`${event.title}-${index}`}><span className={`timeline-node ${index === 0 ? 'latest' : ''}`}><Activity size={14} /></span><div><b>{event.title}</b><p>{event.detail}</p><small>{event.time} · Wallet account event</small></div><button className="icon-button tiny" aria-label="Copy event" onClick={() => onCopy(`${event.title} — ${event.detail}`)}><Copy size={14} /></button></div>)}{activity.length === 0 && <div className="empty-state"><ClipboardCheck size={25} /><h3>No activity yet</h3><p>Actions you take will appear here.</p></div>}</div><div className="audit-legend"><span><i className="legend-dot app-event" /> Application event</span><span><i className="legend-dot chain-event" /> Chain data: not connected</span></div></section></div>
 }
 
-function SettingsPage({ role, username, authMode, walletConnected, walletAddress, walletChainId, configuredChainId, contractAddress, walletProviders, selectedWalletId, apiBusy, setSelectedWalletId, onRefreshWallets, onLinkWallet, theme, setTheme, onCopy, onSignOut, onRequestRemove, onStartTour, onReset }: {
+function SettingsPage({ role, username, authMode, walletConnected, walletAddress, walletChainId, configuredChainId, contractAddress, walletProviders, selectedWalletId, apiBusy, onChangeRole, setSelectedWalletId, onRefreshWallets, onLinkWallet, theme, setTheme, onCopy, onSignOut, onRequestRemove, onStartTour, onReset }: {
   role: Role
   username: string
   authMode: 'password' | 'wallet'
@@ -1776,6 +1891,7 @@ function SettingsPage({ role, username, authMode, walletConnected, walletAddress
   walletProviders: EvmWalletInfo[]
   selectedWalletId: string
   apiBusy: boolean
+  onChangeRole: (role: MarketplaceRole) => void
   setSelectedWalletId: (id: string) => void
   onRefreshWallets: () => void
   onLinkWallet: () => void
@@ -1787,6 +1903,13 @@ function SettingsPage({ role, username, authMode, walletConnected, walletAddress
   onStartTour: () => void
   onReset: () => void
 }) {
+  const editableRole: Partial<Record<Role, MarketplaceRole>> = {
+    'Energy Producer': 'prosumer',
+    'Energy Consumer': 'consumer',
+    'Producer & Consumer': 'both',
+    Investor: 'funder',
+  }
+  const selectedMarketplaceRole = editableRole[role]
   return (
     <div className="page-stack settings-grid">
       <section className="panel settings-card">
@@ -1795,7 +1918,9 @@ function SettingsPage({ role, username, authMode, walletConnected, walletAddress
           <span className="section-kicker">ACCOUNT</span>
           <h2>Profile & role</h2>
           <p>{authMode === 'password' ? 'Your account uses username and password authentication. Link an EVM wallet to unlock wallet-dependent marketplace and blockchain actions.' : 'Your account is authenticated by your EVM wallet. Verifier and administrator access is assigned only by an operator allowlist.'}</p>
-          <div className="settings-field">Wallet role <b>{role}</b></div>
+          {selectedMarketplaceRole
+            ? <label className="settings-field">Participation role<select value={selectedMarketplaceRole} disabled={apiBusy} onChange={(event) => onChangeRole(event.target.value as MarketplaceRole)}><option value="prosumer">Energy Producer · offer energy</option><option value="consumer">Energy Consumer · request energy</option><option value="both">Producer & Consumer · offer and request</option><option value="funder">Investor · register non-cash project interest</option></select></label>
+            : <div className="settings-field">Platform role <b>{role} · operator managed</b></div>}
           {username && <div className="settings-field">Username <b>@{username}</b></div>}
           <div className="settings-note"><CircleHelp size={15} /> {walletConnected ? 'An EVM wallet is linked after signature verification. Bright Ledger never receives its private key.' : 'No wallet is linked. Wallet-dependent listings, trades, and blockchain actions remain unavailable until you link one.'}</div>
           {!walletConnected && <div className="web3-profile">
@@ -1856,7 +1981,7 @@ function SettingsPage({ role, username, authMode, walletConnected, walletAddress
   )
 }
 
-function Modal({ kind, onClose, onListing, onProject, onEstimateProject, onMatch, onFund, onEvidenceSubmit, onEvidenceAIReview, onEvidenceFileChange, aiEvidenceReview, aiEvidenceLoading, listing, project, evidence, role, onReview, onSettle, trade }: {
+function Modal({ kind, onClose, onListing, onProject, onEstimateProject, onMatch, onFund, onEvidenceSubmit, onEvidenceAIReview, onEvidenceFileChange, aiEvidenceReview, aiEvidenceLoading, listing, project, evidence, role, chainPaymentsEnabled, onReview, onSettle, trade }: {
   kind: 'listing' | 'project' | 'match' | 'fund' | 'evidence'
   onClose: () => void
   onListing: (event: React.FormEvent<HTMLFormElement>) => void
@@ -1873,6 +1998,7 @@ function Modal({ kind, onClose, onListing, onProject, onEstimateProject, onMatch
   project: Project | null
   evidence: Evidence | null
   role: Role
+  chainPaymentsEnabled: boolean
   onReview: (item: Evidence, decision: 'Approved' | 'Rejected') => void
   onSettle: (trade: Trade) => void
   trade?: Trade
@@ -1880,8 +2006,8 @@ function Modal({ kind, onClose, onListing, onProject, onEstimateProject, onMatch
   const [fundingEstimate, setFundingEstimate] = useState<ProjectFundingEstimate | null>(null)
   const [fundingEstimateBusy, setFundingEstimateBusy] = useState(false)
   const [fundingEstimateError, setFundingEstimateError] = useState('')
-  const heading = kind === 'listing' ? 'Create an energy listing' : kind === 'project' ? 'List a solar-ready site' : kind === 'match' ? listing?.type === 'request' ? 'Review request match proposal' : 'Review match proposal' : kind === 'fund' ? 'Record a non-cash pledge' : 'Evidence review'
-  const subheading = kind === 'listing' ? 'Share energy with your local microgrid.' : kind === 'project' ? 'Add a site for community solar discovery.' : kind === 'match' ? 'Check the terms before confirming a match.' : kind === 'fund' ? 'A pledge is an expression of interest; no money is transferred.' : 'Inspect the submitted reading and its verification state.'
+  const heading = kind === 'listing' ? 'Create an energy listing' : kind === 'project' ? 'Create a solar fundraiser' : kind === 'match' ? listing?.type === 'request' ? 'Review request match proposal' : 'Review match proposal' : kind === 'fund' ? 'Register investor interest' : 'Evidence review'
+  const subheading = kind === 'listing' ? 'Share energy with your local microgrid.' : kind === 'project' ? 'Present a project site and a cost-based funding goal.' : kind === 'match' ? 'Check the terms before confirming a match.' : kind === 'fund' ? 'This records non-cash interest only; no investment or payment occurs.' : 'Inspect the submitted reading and its verification state.'
   function requestAiReview(event: React.MouseEvent<HTMLButtonElement>) {
     const form = event.currentTarget.form
     const fileInput = form?.querySelector<HTMLInputElement>('input[name="evidenceFile"]')
@@ -1952,7 +2078,7 @@ function Modal({ kind, onClose, onListing, onProject, onEstimateProject, onMatch
     if (target instanceof HTMLInputElement) target.readOnly = false
   }
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><div className="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div className="modal-heading"><div><span className="section-kicker">BRIGHT LEDGER</span><h2 id="modal-title">{heading}</h2><p>{subheading}</p></div><button className="icon-button" onClick={onClose} aria-label="Close dialog"><X size={19} /></button></div>
-    {kind === 'listing' && <form className="modal-form" onSubmit={onListing}><label>Listing type<select name="type" defaultValue={role === 'Consumer' ? 'request' : 'offer'}><option value="offer">Offer · I have energy to share</option><option value="request">Request · I need energy</option></select></label><div className="form-row"><label>Energy quantity<input name="quantity" type="number" min="0.1" max="10000" step="0.1" placeholder="e.g. 8.5" required /><small>kWh</small></label><label>Price per kWh<input name="price" type="number" min="0.0001" max="1000" step="0.0001" placeholder="Enter USD/kWh" required /><small>Set the price you want to offer or are willing to pay; Bright Ledger does not calculate or recommend a rate.</small></label></div><div className="form-row"><label>Microgrid / area<input name="area" placeholder="City, country" required /></label><label>Renewable source<select name="source"><option>Rooftop solar</option><option>Solar + storage</option><option>Community solar</option><option>Any renewable</option></select></label></div><label>Delivery window<select name="window"><option>Today, 2:00–6:00 PM</option><option>Today, 4:00–8:00 PM</option><option>Tomorrow, 9:00 AM</option></select></label><div className="modal-disclosure"><ShieldCheck size={15} /> Listings are saved to the shared Bright Ledger database.</div><div className="modal-actions"><button type="button" className="button button-outline" onClick={onClose}>Cancel</button><button type="submit" className="button button-primary">Publish listing <ArrowRight size={15} /></button></div></form>}
+    {kind === 'listing' && <form className="modal-form" onSubmit={onListing}><label>Listing type<select name="type" defaultValue={role === 'Energy Consumer' ? 'request' : 'offer'}><option value="offer">Energy offer · I produce energy to share</option><option value="request">Energy request · I want to buy energy</option></select></label><div className="form-row"><label>Energy quantity<input name="quantity" type="number" min="0.1" max="10000" step="0.1" placeholder="e.g. 8.5" required /><small>kWh</small></label><label>Price per kWh<input name="price" type="number" min="0.0001" max="1000" step="0.0001" placeholder="Enter USD/kWh" required /><small>Set the price you want to offer or are willing to pay; Bright Ledger does not calculate or recommend a rate.</small></label></div><div className="form-row"><label>Microgrid / area<input name="area" placeholder="City, country" required /></label><label>Renewable source<select name="source"><option>Rooftop solar</option><option>Solar + storage</option><option>Community solar</option><option>Any renewable</option></select></label></div><label>Delivery window<select name="window"><option>Today, 2:00–6:00 PM</option><option>Today, 4:00–8:00 PM</option><option>Tomorrow, 9:00 AM</option></select></label><div className="modal-disclosure"><ShieldCheck size={15} /> Listings are saved to the shared Bright Ledger database.</div><div className="modal-actions"><button type="button" className="button button-outline" onClick={onClose}>Cancel</button><button type="submit" className="button button-primary">Publish listing <ArrowRight size={15} /></button></div></form>}
     {kind === 'project' && <form className="modal-form" onSubmit={onProject} onChange={invalidateFundingEstimate}>
       <label>Project / site name<input name="name" placeholder="Use a fictional prototype name" required /></label>
       <div className="form-row"><label>Approximate location<input name="location" placeholder="City, country only" required /><small>Do not enter a street address. This location is shared with the AI provider only after consent.</small></label><label>Site type<select name="siteType"><option>Residential rooftop</option><option>Shared rooftop</option><option>Community facility</option><option>Commercial rooftop</option><option>Open land</option></select></label></div>
@@ -1962,27 +2088,27 @@ function Modal({ kind, onClose, onListing, onProject, onEstimateProject, onMatch
         <div className="form-row"><label>Permitting<input name="permittingUsd" type="number" min="0" step="0.01" placeholder="Permits and inspection" required /></label><label>Grid interconnection<input name="interconnectionUsd" type="number" min="0" step="0.01" placeholder="Connection and metering" required /></label></div>
         <div className="form-row"><label>Other project costs<input name="otherUsd" type="number" min="0" step="0.01" placeholder="Additional documented costs" required /></label><label>Contingency<input name="contingencyPercent" type="number" min="0" max="25" step="1" placeholder="0–25%" required /><small>Percent of entered direct costs.</small></label></div>
       </div>
-      <div className="form-row revenue-share-inputs"><label>Owner share<input name="ownerShare" type="number" min="0" max="100" step="1" placeholder="%" required /></label><label>Funder share<input name="funderShare" type="number" min="0" max="100" step="1" placeholder="%" required /></label><label>Community share<input name="communityShare" type="number" min="0" max="100" step="1" placeholder="%" required /></label></div>
+      <div className="form-row revenue-share-inputs"><label>Project Owner share<input name="ownerShare" type="number" min="0" max="100" step="1" placeholder="%" required /></label><label>Investor share<input name="funderShare" type="number" min="0" max="100" step="1" placeholder="%" required /></label><label>Community share<input name="communityShare" type="number" min="0" max="100" step="1" placeholder="%" required /></label></div>
       <label>Permission status<select name="permission"><option>Owner permission stated</option><option>Permission pending review</option><option>Shared community space</option></select></label>
       <label>Site notes<textarea name="notes" rows={2} placeholder="Optional non-sensitive context." /></label>
-      <label className="ai-consent"><input name="fundingAiConsent" type="checkbox" /> I consent to sending the approximate location, site type, area, cost inputs and proposed revenue shares to OpenRouter for advisory review. Do not include personal or confidential data.</label>
+      <label className="ai-consent"><input name="fundingAiConsent" type="checkbox" /> I consent to sending the approximate location, site type, area, cost inputs and proposed revenue shares to OpenRouter for an advisory project assessment. Do not include personal or confidential data.</label>
       <input type="hidden" name="fundingEstimateId" />
-      <button type="button" className="button button-secondary" onClick={(event) => { void requestProjectEstimate(event) }} disabled={fundingEstimateBusy}>{fundingEstimateBusy ? 'Reviewing plan…' : 'Calculate funding & ask AI to review'} <TrendingUp size={15} /></button>
+      <button type="button" className="button button-secondary" onClick={(event) => { void requestProjectEstimate(event) }} disabled={fundingEstimateBusy}>{fundingEstimateBusy ? 'Assessing project…' : 'Calculate funding & assess project'} <TrendingUp size={15} /></button>
       {fundingEstimateError && <p className="funding-estimate-error" role="alert">{fundingEstimateError}</p>}
       {fundingEstimate && <div className="funding-estimate-result" role="status"><div className="funding-estimate-total"><span>Required funding from your cost inputs</span><b>{formatUSD(fundingEstimate.requiredFundingUsd)}</b><small>Capacity estimate: {fundingEstimate.capacityKwp} kWp · user-entered cost basis · not a supplier quote</small></div>
         <ul>{fundingEstimate.costBreakdown.map((item) => <li key={item.category}><span>{item.category}</span><b>{formatUSD(item.amountMinor / 100)}</b></li>)}<li><span>Contingency</span><b>{formatUSD(fundingEstimate.contingencyMinor / 100)}</b></li></ul>
-        <p><b>AI advisory · {fundingEstimate.aiReview.confidence} confidence</b><br />{fundingEstimate.aiReview.summary}</p>
+        <p><b>AI project assessment · {fundingEstimate.aiReview.confidence} confidence · advisory only</b><br />{fundingEstimate.aiReview.summary}</p>
         {fundingEstimate.aiReview.flags.length > 0 && <div><b>Assumptions to check</b><ul>{fundingEstimate.aiReview.flags.map((item) => <li key={item}>{item}</li>)}</ul></div>}
         {fundingEstimate.aiReview.suggestedChecks.length > 0 && <div><b>Suggested verification</b><ul>{fundingEstimate.aiReview.suggestedChecks.map((item) => <li key={item}>{item}</li>)}</ul></div>}
-        <div className="funding-share-suggestion"><span>AI-proposed revenue split · not financial advice</span><b>Owner {fundingEstimate.aiReview.suggestedRevenueShares.owner}% · Funder {fundingEstimate.aiReview.suggestedRevenueShares.funder}% · Community {fundingEstimate.aiReview.suggestedRevenueShares.community}%</b><button type="button" className="text-link" onClick={(event) => { const form = event.currentTarget.form; if (!form) return; const shares = fundingEstimate.aiReview.suggestedRevenueShares; for (const [name, value] of Object.entries({ ownerShare: shares.owner, funderShare: shares.funder, communityShare: shares.community })) { const field = form.elements.namedItem(name); if (field instanceof HTMLInputElement) field.value = String(value) } }}>Apply suggested split</button></div>
+        <div className="funding-share-suggestion"><span>AI-proposed revenue allocation · advisory only</span><b>Project Owner {fundingEstimate.aiReview.suggestedRevenueShares.owner}% · Investor {fundingEstimate.aiReview.suggestedRevenueShares.funder}% · Community {fundingEstimate.aiReview.suggestedRevenueShares.community}%</b><button type="button" className="text-link" onClick={(event) => { const form = event.currentTarget.form; if (!form) return; const shares = fundingEstimate.aiReview.suggestedRevenueShares; for (const [name, value] of Object.entries({ ownerShare: shares.owner, funderShare: shares.funder, communityShare: shares.community })) { const field = form.elements.namedItem(name); if (field instanceof HTMLInputElement) field.value = String(value) } }}>Apply suggested allocation</button></div>
         <small>{fundingEstimate.aiReview.model} · review the assumptions and choose all shares yourself before publishing.</small>
       </div>}
-      <div className="modal-disclosure"><ShieldCheck size={15} /> Funding estimates use your cost entries; pledges are recorded in the database but do not move money. New sites require human review.</div>
-      <div className="modal-actions"><button type="button" className="button button-outline" onClick={onClose}>Cancel</button><button type="submit" className="button button-primary">Submit site for review <ArrowRight size={15} /></button></div>
+      <div className="modal-disclosure"><ShieldCheck size={15} /> Funding estimates use your cost inputs. Investor interest is a simulated record: no money is collected, invested, or distributed. New sites require human review.</div>
+      <div className="modal-actions"><button type="button" className="button button-outline" onClick={onClose}>Cancel</button><button type="submit" className="button button-primary">Submit fundraiser for review <ArrowRight size={15} /></button></div>
     </form>}
     {kind === 'match' && listing && <form className="modal-form" onSubmit={onMatch}><div className="match-summary"><div className="listing-avatar">{listing.owner.split(' ').map((part) => part[0]).join('').slice(0, 2)}</div><div><b>{listing.owner}</b><span>{listing.area} · {listing.source}</span></div><Status status="Open" /></div><div className="match-term-row"><span>Available energy</span><b>{listing.quantity} kWh</b></div><div className="match-term-row"><span>Agreed unit price</span><b>${listing.price.toFixed(2)} / kWh</b></div><label>Quantity to request<input name="quantity" type="number" min="0.1" max={listing.quantity} step="0.1" defaultValue={Math.min(5, listing.quantity)} required /><small>Cannot exceed the available listing quantity.</small></label><div className="match-estimate"><span>Illustrative total · not a payment</span><b>${(listing.price * Math.min(5, listing.quantity)).toFixed(2)}</b></div><div className="modal-disclosure"><ShieldCheck size={15} /> A match reserves listing quantity. No payment or electricity delivery occurs.</div><div className="modal-actions"><button type="button" className="button button-outline" onClick={onClose}>Cancel</button><button type="submit" className="button button-primary">{listing.type === 'offer' ? 'Request match' : 'Propose match'} <ArrowRight size={15} /></button></div></form>}
-    {kind === 'fund' && project && <form className="modal-form" onSubmit={onFund}><div className="fund-project-summary"><div className="project-mini-sun"><Sun size={22} /></div><div><b>{project.name}</b><span>{project.location}</span></div></div><div className="fund-progress-line"><span>Recorded pledges</span><b>{pct(project.raised, project.target)}%</b></div><div className="progress-track"><i style={{ width: `${pct(project.raised, project.target)}%` }} /></div><div className="funding-amount"><span>{formatUSD(project.raised)} <small>pledged</small></span><span>{formatUSD(project.target - project.raised)} <small>remaining</small></span></div><label>Pledge amount<input name="amount" type="number" min="1" max={project.target - project.raised} step="1" placeholder="e.g. 250" required /><small>USD · recorded as a non-cash pledge; no payment is made</small></label><div className="modal-disclosure"><ShieldCheck size={15} /> This is not an investment, payment, or promise of financial return.</div><div className="modal-actions"><button type="button" className="button button-outline" onClick={onClose}>Cancel</button><button type="submit" className="button button-primary">Record pledge <ArrowRight size={15} /></button></div></form>}
-    {kind === 'evidence' && !evidence && trade && <form className="modal-form" onSubmit={(event) => onEvidenceSubmit(event, trade)}><div className="match-summary"><div className="listing-avatar"><Sun size={15} /></div><div><b>{trade.id} · {trade.quantity} kWh</b><span>Delivery evidence for {trade.seller}</span></div><Status status={trade.status} /></div><label>Reported energy delivered<input name="quantity" type="number" min="0.1" max={trade.quantity} step="0.1" defaultValue={trade.quantity} required /><small>kWh · cannot exceed the committed trade quantity</small></label><div className="form-row"><label>Evidence source<input name="source" maxLength={120} placeholder="Meter, inverter, manual reading source" required /></label><label>Reading interval<select name="interval"><option>Current reading interval</option><option>Previous reading interval</option></select></label></div><label>Meter or inverter evidence<input name="evidenceFile" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf,.csv,image/jpeg,image/png,image/webp,application/pdf,text/csv" onChange={onEvidenceFileChange} /><small>JPEG, PNG, WebP, PDF or UTF-8 CSV · maximum 8 MB · stored with this PostgreSQL record and available only to trade participants and authorized verifiers.</small></label><label className="ai-consent"><input name="aiConsent" type="checkbox" /> I consent to sending this file to OpenRouter for advisory AI analysis. Provider data-handling policies apply.</label><div className="ai-review-controls"><button type="button" className="button button-secondary" onClick={requestAiReview} disabled={aiEvidenceLoading}>{aiEvidenceLoading ? 'Checking evidence…' : 'Run AI evidence check'} <ShieldCheck size={15} /></button><span>Advisory only · never auto-approved</span></div>{aiEvidenceReview && <div className="ai-review-result" role="status"><b>AI triage · {aiEvidenceReview.analysis.confidence} confidence</b><p>{aiEvidenceReview.analysis.summary}</p>{aiEvidenceReview.analysis.flags.length > 0 && <div><span>Potential issues to inspect</span><ul>{aiEvidenceReview.analysis.flags.map((flag) => <li key={flag}>{flag}</li>)}</ul></div>}<div><span>Suggested human checks</span><ul>{aiEvidenceReview.analysis.suggestedChecks.map((check) => <li key={check}>{check}</li>)}</ul></div><small>Model: {aiEvidenceReview.model} · File SHA-256: {aiEvidenceReview.fileSha256} · Review is not proof of authenticity, generation, or delivery.</small></div>}<div className="modal-disclosure"><ShieldCheck size={15} /> The file is stored in the app database on submission. It is sent to OpenRouter only when you request AI review and consent. A verifier must make the final review decision before settlement.</div><div className="modal-actions"><button type="button" className="button button-outline" onClick={onClose}>Cancel</button><button type="submit" className="button button-primary">Submit evidence <ArrowRight size={15} /></button></div></form>}
+    {kind === 'fund' && project && <form className="modal-form" onSubmit={onFund}><div className="fund-project-summary"><div className="project-mini-sun"><Sun size={22} /></div><div><b>{project.name}</b><span>{project.location}</span></div></div><div className="fund-progress-line"><span>Recorded contribution interest</span><b>{pct(project.raised, project.target)}%</b></div><div className="progress-track"><i style={{ width: `${pct(project.raised, project.target)}%` }} /></div><div className="funding-amount"><span>{formatUSD(project.raised)} <small>recorded</small></span><span>{formatUSD(project.target - project.raised)} <small>goal remaining</small></span></div><label>Proposed contribution amount<input name="amount" type="number" min="1" max={project.target - project.raised} step="1" placeholder="e.g. 250" required /><small>USD · recorded as simulated non-cash interest; no payment is made</small></label><div className="modal-disclosure"><ShieldCheck size={15} /> This is not an investment, payment, or promise of financial return.</div><div className="modal-actions"><button type="button" className="button button-outline" onClick={onClose}>Cancel</button><button type="submit" className="button button-primary">Register interest <ArrowRight size={15} /></button></div></form>}
+    {kind === 'evidence' && !evidence && trade && <form className="modal-form" onSubmit={(event) => onEvidenceSubmit(event, trade)}><div className="match-summary"><div className="listing-avatar"><Sun size={15} /></div><div><b>{trade.id} · {trade.quantity} kWh</b><span>Delivery evidence for {trade.seller}</span></div><Status status={trade.status} /></div><label>Reported energy delivered<input name="quantity" type="number" min="0.1" max={trade.quantity} step="0.1" defaultValue={trade.quantity} required /><small>kWh · cannot exceed the committed trade quantity</small></label><div className="form-row"><label>Evidence source<input name="source" maxLength={120} placeholder="Meter, inverter, manual reading source" required /></label><label>Reading interval<select name="interval"><option>Current reading interval</option><option>Previous reading interval</option></select></label></div><label>Meter or inverter evidence<input name="evidenceFile" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf,.csv,image/jpeg,image/png,image/webp,application/pdf,text/csv" onChange={onEvidenceFileChange} /><small>JPEG, PNG, WebP, PDF or UTF-8 CSV · maximum 8 MB · stored with this PostgreSQL record and available only to trade participants and authorized verifiers.</small></label><label className="ai-consent"><input name="aiConsent" type="checkbox" /> I consent to sending this file to OpenRouter for advisory AI analysis. Provider data-handling policies apply.</label><div className="ai-review-controls"><button type="button" className="button button-secondary" onClick={requestAiReview} disabled={aiEvidenceLoading}>{aiEvidenceLoading ? 'Checking evidence…' : 'Run AI evidence check'} <ShieldCheck size={15} /></button><span>Advisory only · never auto-approved</span></div>{aiEvidenceReview && <div className="ai-review-result" role="status"><b>AI triage · {aiEvidenceReview.analysis.confidence} confidence</b><p>{aiEvidenceReview.analysis.summary}</p>{aiEvidenceReview.analysis.flags.length > 0 && <div><span>Potential issues to inspect</span><ul>{aiEvidenceReview.analysis.flags.map((flag) => <li key={flag}>{flag}</li>)}</ul></div>}<div><span>Suggested human checks</span><ul>{aiEvidenceReview.analysis.suggestedChecks.map((check) => <li key={check}>{check}</li>)}</ul></div><small>Model: {aiEvidenceReview.model} · File SHA-256: {aiEvidenceReview.fileSha256} · Review is not proof of authenticity, generation, or delivery.</small></div>}    <div className="modal-disclosure"><ShieldCheck size={15} /> The file is stored in the app database on submission. It is sent to OpenRouter only when you request AI review and consent. The buyer reviews delivery evidence; verifiers resolve disputes.</div><div className="modal-actions"><button type="button" className="button button-outline" onClick={onClose}>Cancel</button><button type="submit" className="button button-primary">Submit delivery evidence <ArrowRight size={15} /></button></div></form>}
     {kind === 'evidence' && evidence && <div className="modal-form">
       <div className="evidence-detail-callout"><ShieldCheck size={20} /><span><b>{evidence.id} · {evidence.source}</b><small>Reading record · not independently verified</small></span><Status status={evidence.status} /></div>
       <div className="match-term-row"><span>Linked trade</span><b>{evidence.trade}</b></div>
@@ -1991,10 +2117,19 @@ function Modal({ kind, onClose, onListing, onProject, onEstimateProject, onMatch
       <div className="match-term-row"><span>Evidence context</span><b>{evidence.project}</b></div>
       {evidence.reference && <div className="match-term-row"><span>Evidence reference</span><b>{evidence.reference}</b></div>}
       {evidence.evidenceFileSha256 && <div className="evidence-file-hash">File SHA-256: <code>{evidence.evidenceFileSha256}</code></div>}
+      {evidence.reason && <div className="rejection-reason">{evidence.status === 'Disputed' ? 'Buyer dispute reason' : 'Review note'}: {evidence.reason}</div>}
       {evidence.aiReview && <div className="ai-review-result"><b>AI advisory review · {evidence.aiReview.analysis.confidence} confidence</b><p>{evidence.aiReview.analysis.summary}</p>{evidence.aiReview.analysis.flags.length > 0 && <div><span>Potential issues to inspect</span><ul>{evidence.aiReview.analysis.flags.map((flag) => <li key={flag}>{flag}</li>)}</ul></div>}<div><span>Suggested human checks</span><ul>{evidence.aiReview.analysis.suggestedChecks.map((check) => <li key={check}>{check}</li>)}</ul></div><small>{evidence.aiReview.model} · advisory only · review ID {evidence.aiReview.id}</small></div>}
-      <div className="match-term-row"><span>Verification</span><b className="provenance"><ShieldCheck size={14} /> {evidence.status === 'Approved' ? 'Approved by assigned verifier' : evidence.status === 'Rejected' ? 'Rejected · excluded from settlement' : 'Pending review'}</b></div>
-      <div className="modal-disclosure">Approval is an application record only. It does not verify real meter data.</div>
-      <div className="modal-actions">{evidence.status === 'Pending' && (role === 'Verifier' || role === 'Admin') && <><button className="button button-danger-outline" onClick={() => onReview(evidence, 'Rejected')}>Reject with reason</button><button className="button button-approve" onClick={() => onReview(evidence, 'Approved')}><Check size={15} /> Approve evidence</button></>}{evidence.status === 'Pending' && (role !== 'Verifier' && role !== 'Admin') && <span className="permission-note"><ShieldCheck size={14} /> Switch to Verifier role to review</span>}{evidence.status === 'Approved' && trade?.status === 'Ready to settle' && <button className="button button-primary" onClick={() => { onSettle(trade); onClose() }}>Settle trade record <ArrowRight size={14} /></button>}{evidence.status !== 'Pending' && !(evidence.status === 'Approved' && trade?.status === 'Ready to settle') && <button className="button button-outline" onClick={onClose}>Close</button>}</div>
+      <div className="match-term-row"><span>Review state</span><b className="provenance"><ShieldCheck size={14} /> {evidence.status === 'Approved' ? 'Buyer approved delivery' : evidence.status === 'Rejected' ? 'Dispute resolved for buyer' : evidence.status === 'Disputed' ? 'Dispute open · escrow remains locked' : 'Awaiting buyer review'}</b></div>
+      <div className="modal-disclosure">{evidence.status === 'Disputed'
+        ? chainPaymentsEnabled ? 'An authorized verifier resolves the appeal by releasing escrow to the seller or refunding it to the buyer.' : 'An authorized verifier resolves the appeal for the buyer or seller. This deployment does not move funds.'
+        : chainPaymentsEnabled ? 'The buyer can approve delivery to release escrow or open a dispute. Evidence upload itself never moves funds.' : 'The buyer can approve delivery or open a dispute. This deployment records decisions without moving funds.'}</div>
+      <div className="modal-actions">
+        {evidence.status === 'Pending' && evidence.buyerCanReview && <><button className="button button-danger-outline" onClick={() => onReview(evidence, 'Rejected')}>Open dispute</button><button className="button button-approve" onClick={() => onReview(evidence, 'Approved')}><Check size={15} /> {chainPaymentsEnabled ? 'Approve & release escrow' : 'Approve delivery'}</button></>}
+        {evidence.status === 'Pending' && !evidence.buyerCanReview && <span className="permission-note"><ShieldCheck size={14} /> Waiting for the buyer to review</span>}
+        {evidence.status === 'Disputed' && (role === 'Verifier' || role === 'Admin') && <><button className="button button-danger-outline" onClick={() => onReview(evidence, 'Rejected')}>{chainPaymentsEnabled ? 'Refund buyer' : 'Resolve for buyer'}</button><button className="button button-approve" onClick={() => onReview(evidence, 'Approved')}><Check size={15} /> {chainPaymentsEnabled ? 'Release to seller' : 'Resolve for seller'}</button></>}
+        {evidence.status === 'Approved' && trade?.status === 'Ready to settle' && <button className="button button-primary" onClick={() => { onSettle(trade); onClose() }}>Settle trade record <ArrowRight size={14} /></button>}
+        {(evidence.status === 'Rejected' || (evidence.status === 'Disputed' && role !== 'Verifier' && role !== 'Admin') || (evidence.status === 'Approved' && trade?.status !== 'Ready to settle')) && <button className="button button-outline" onClick={onClose}>Close</button>}
+      </div>
     </div>}
     </div></div>
 }
