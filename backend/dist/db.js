@@ -39,7 +39,7 @@ export async function transaction(work) {
 }
 export async function migrate() {
     const migrationsPath = resolve(moduleDirectory, '../migrations');
-    for (const migration of ['001_initial.sql', '002_trade_counter_listing.sql', '003_usd_pricing.sql', '004_ai_evidence_review.sql', '005_global_sample_locations.sql', '006_solar_funding_estimates.sql', '007_evidence_file_storage.sql', '008_wallet_sessions_and_ai_project_gate.sql', '009_wallet_notifications_and_pledges.sql']) {
+    for (const migration of ['001_initial.sql', '002_trade_counter_listing.sql', '003_usd_pricing.sql', '004_ai_evidence_review.sql', '005_global_sample_locations.sql', '006_solar_funding_estimates.sql', '007_evidence_file_storage.sql', '008_wallet_sessions_and_ai_project_gate.sql', '009_wallet_notifications_and_pledges.sql', '010_username_password_accounts.sql']) {
         const sql = await readFile(resolve(migrationsPath, migration), 'utf8');
         await transaction(async (client) => {
             await client.query('SELECT pg_advisory_xact_lock($1)', [73421608]);

@@ -7,7 +7,7 @@ import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
 import multer from 'multer';
 import { z } from 'zod';
-import { requireAuth, allowRoles, createWalletNonce, verifyWalletSignature, createAccountRemovalChallenge, removeWalletAccount, revokeCurrentSession } from './auth.js';
+import { requireAuth, allowRoles, createWalletNonce, verifyWalletSignature, createAccountRemovalChallenge, createWalletLinkNonce, loginPasswordAccount, registerPasswordAccount, removeWalletAccount, revokeCurrentSession, verifyWalletLink } from './auth.js';
 import { query, transaction } from './db.js';
 import { asyncRoute, errorHandler, HttpError } from './errors.js';
 import { findCompatibleMatch } from './market-policy.js';
@@ -20,6 +20,13 @@ function routeId(request) {
     if (typeof id !== 'string')
         throw new HttpError(400, 'A single resource ID is required.', 'INVALID_RESOURCE_ID');
     return id;
+}
+function requireLinkedWallet(request, _response, next) {
+    if (!request.user?.walletAddress) {
+        next(new HttpError(403, 'Link a compatible EVM wallet in Settings before creating listings or taking part in trades.', 'WALLET_LINK_REQUIRED'));
+        return;
+    }
+    next();
 }
 api.disable('x-powered-by');
 api.use(helmet());
@@ -50,10 +57,12 @@ const rpcUrl = process.env.CHAIN_RPC_URL?.trim() || (chainId === 84532 && proces
 const contractAddress = process.env.CONTRACT_ADDRESS ?? '';
 const provider = rpcUrl ? new JsonRpcProvider(rpcUrl) : null;
 const tradingInterface = new Interface([
-    'event TradeCommitted(bytes32 indexed tradeId,address indexed buyer,address indexed seller,uint64 energyWh,uint128 pricePerKWhScaled)',
+    'event TradeCommitted(bytes32 indexed tradeId,address indexed buyer,address indexed seller,uint64 energyWh,uint128 pricePerKWhScaled,uint256 paymentWei)',
     'event EvidenceSubmitted(bytes32 indexed tradeId,bytes32 evidenceHash)',
     'event EvidenceReviewed(bytes32 indexed tradeId,bool approved,bytes32 reasonHash)',
     'event TradeSettled(bytes32 indexed tradeId,address indexed buyer,address indexed seller,uint64 energyWh,uint256 buyerPoints,uint256 sellerPoints)',
+    'event TradePaymentReleased(bytes32 indexed tradeId,address indexed seller,uint256 amountWei)',
+    'event TradePaymentRefunded(bytes32 indexed tradeId,address indexed buyer,uint256 amountWei)',
 ]);
 api.get('/api/health', asyncRoute(async (_request, response) => {
     await query('SELECT 1');
@@ -88,15 +97,26 @@ api.get('/api/market/benchmark', asyncRoute(async (request, response) => {
 }));
 api.post('/api/auth/nonce', createWalletNonce);
 api.post('/api/auth/verify', verifyWalletSignature);
+api.post('/api/auth/register', registerPasswordAccount);
+api.post('/api/auth/login', loginPasswordAccount);
 api.use('/api', requireAuth);
 api.get('/api/me', (request, response) => {
-    response.json({ id: request.user.id, displayName: request.user.displayName, role: request.user.role, walletAddress: request.user.walletAddress });
+    response.json({ id: request.user.id, username: request.user.username, displayName: request.user.displayName, role: request.user.role, walletAddress: request.user.walletAddress, authMethod: request.user.authMethod ?? 'wallet' });
 });
 api.delete('/api/auth/session', revokeCurrentSession);
 api.post('/api/auth/account-removal-challenge', createAccountRemovalChallenge);
+api.post('/api/auth/wallet-link/nonce', createWalletLinkNonce);
+api.post('/api/auth/wallet-link/verify', verifyWalletLink);
 api.delete('/api/me', removeWalletAccount);
 api.get('/api/config', (_request, response) => {
-    response.json({ chain: { chainId, enabled: Boolean(provider && contractAddress), contractAddress: contractAddress || null } });
+    response.json({
+        chain: {
+            chainId,
+            enabled: Boolean(provider && contractAddress),
+            paymentsEnabled: chainId === 11155111 && Boolean(provider && contractAddress),
+            contractAddress: contractAddress || null,
+        },
+    });
 });
 api.get('/api/bootstrap', asyncRoute(async (request, response) => {
     const userId = request.user.id;
@@ -193,7 +213,7 @@ const listingInput = z.object({
     deliveryEnd: z.string().datetime(),
     note: z.string().max(500).optional().default(''),
 }).refine((value) => new Date(value.deliveryEnd) > new Date(value.deliveryStart), { message: 'Delivery end must be after the start.' });
-api.post('/api/listings', asyncRoute(async (request, response) => {
+api.post('/api/listings', requireLinkedWallet, asyncRoute(async (request, response) => {
     const input = listingInput.parse(request.body);
     const role = request.user.role;
     if (input.type === 'offer' && !['prosumer', 'both', 'admin'].includes(role)) {
@@ -223,7 +243,7 @@ api.patch('/api/listings/:id', asyncRoute(async (request, response) => {
     await query('INSERT INTO audit_events(actor_id,event_type,entity_type,entity_id) VALUES($1,$2,$3,$4)', [request.user.id, `listing.${eventName}`, 'listing', request.params.id]);
     response.json({ data: result.rows[0] });
 }));
-api.post('/api/trades', asyncRoute(async (request, response) => {
+api.post('/api/trades', requireLinkedWallet, asyncRoute(async (request, response) => {
     const input = z.object({ listingId: z.string().min(5).max(80), quantity: z.number().positive().max(100_000) }).parse(request.body);
     const result = await transaction(async (client) => {
         const listingResult = await client.query(`SELECT l.id,l.public_id AS "publicId",l.type,l.owner_id AS "ownerId",l.available_kwh AS available,
@@ -270,7 +290,7 @@ api.post('/api/trades', asyncRoute(async (request, response) => {
     });
     response.status(201).json({ data: { ...result, buyer: listingParticipantName('buyer', request.user, listingType(request.body)), seller: listingParticipantName('seller', request.user, listingType(request.body)), quantity: Number(result.quantity), price: Number(result.price) } });
 }));
-api.post('/api/trades/:id/confirm', asyncRoute(async (request, response) => {
+api.post('/api/trades/:id/confirm', requireLinkedWallet, asyncRoute(async (request, response) => {
     const result = await transaction(async (client) => {
         const trade = await client.query('SELECT id,buyer_id AS "buyerId",seller_id AS "sellerId",status FROM trades WHERE public_id=$1 FOR UPDATE', [request.params.id]);
         const row = trade.rows[0];
@@ -293,7 +313,7 @@ api.post('/api/trades/:id/confirm', asyncRoute(async (request, response) => {
     });
     response.json({ data: result });
 }));
-api.post('/api/trades/:id/commitment', asyncRoute(async (request, response) => {
+api.post('/api/trades/:id/commitment', requireLinkedWallet, asyncRoute(async (request, response) => {
     const input = z.object({ transactionHash: z.string().regex(/^0x[a-fA-F0-9]{64}$/) }).parse(request.body);
     if (!provider || !contractAddress)
         throw new HttpError(503, 'A blockchain RPC and deployed contract are not configured.', 'CHAIN_NOT_CONFIGURED');
@@ -308,19 +328,21 @@ api.post('/api/trades/:id/commitment', asyncRoute(async (request, response) => {
         throw new HttpError(409, 'This trade is not awaiting a first on-chain commitment.', 'INVALID_TRADE_STATE');
     if (!trade.buyer || !trade.seller)
         throw new HttpError(409, 'Both trade participants need a registered wallet address.', 'PARTICIPANT_WALLETS_REQUIRED');
-    if (trade.buyer?.toLowerCase() !== request.user.walletAddress?.toLowerCase() && trade.seller?.toLowerCase() !== request.user.walletAddress?.toLowerCase()) {
-        throw new HttpError(403, 'Only the wallet participating in this trade can submit its chain transaction.', 'FORBIDDEN');
+    if (trade.buyer?.toLowerCase() !== request.user.walletAddress?.toLowerCase()) {
+        throw new HttpError(403, 'Only the buyer can authorize and fund the on-chain trade commitment.', 'FORBIDDEN');
     }
     const confirmations = await query('SELECT count(*)::int AS count FROM trade_confirmations WHERE trade_id=$1', [trade.id]);
     if (confirmations.rows[0].count < 2)
         throw new HttpError(409, 'Both trade participants must confirm before an on-chain commitment.', 'TRADE_CONFIRMATIONS_REQUIRED');
     const receipt = await provider.getTransactionReceipt(input.transactionHash);
-    if (!receipt || receipt.status !== 1 || receipt.to?.toLowerCase() !== contractAddress.toLowerCase() ||
-        receipt.from.toLowerCase() !== request.user.walletAddress?.toLowerCase()) {
+    const transaction = await provider.getTransaction(input.transactionHash);
+    if (!receipt || !transaction || receipt.status !== 1 || receipt.to?.toLowerCase() !== contractAddress.toLowerCase() ||
+        receipt.from.toLowerCase() !== trade.buyer?.toLowerCase() ||
+        transaction.from.toLowerCase() !== trade.buyer?.toLowerCase()) {
         throw new HttpError(422, 'Transaction receipt is missing, failed, sent by a different wallet, or sent to a different contract.', 'INVALID_CHAIN_RECEIPT');
     }
     const expectedTradeId = keccak256(toUtf8Bytes(trade.publicId));
-    const match = receipt.logs.map((log) => {
+    const match = receipt.logs.filter((log) => log.address.toLowerCase() === contractAddress.toLowerCase()).map((log) => {
         try {
             return tradingInterface.parseLog(log);
         }
@@ -330,7 +352,9 @@ api.post('/api/trades/:id/commitment', asyncRoute(async (request, response) => {
     }).find((event) => event?.name === 'TradeCommitted');
     if (!match || match.args.tradeId !== expectedTradeId || getAddress(match.args.buyer) !== getAddress(trade.buyer) || getAddress(match.args.seller) !== getAddress(trade.seller) ||
         BigInt(match.args.energyWh) !== BigInt(Math.round(Number(trade.quantity) * 1000)) ||
-        BigInt(match.args.pricePerKWhScaled) !== BigInt(Math.round(Number(trade.price) * 10000))) {
+        BigInt(match.args.pricePerKWhScaled) !== BigInt(Math.round(Number(trade.price) * 10000)) ||
+        BigInt(match.args.paymentWei) !== transaction.value ||
+        (chainId === 11155111 && BigInt(match.args.paymentWei) <= 0n)) {
         throw new HttpError(422, 'Confirmed transaction does not commit the agreed trade terms.', 'CHAIN_TERMS_MISMATCH');
     }
     const updated = await query(`UPDATE trades SET chain_id=$2,contract_address=$3,chain_tx_hash=$4,status='committed',updated_at=now()
@@ -340,7 +364,7 @@ api.post('/api/trades/:id/commitment', asyncRoute(async (request, response) => {
     await query('INSERT INTO audit_events(actor_id,event_type,entity_type,entity_id,source,metadata) VALUES($1,$2,$3,$4,$5,$6)', [request.user.id, 'trade.chain_committed', 'trade', trade.publicId, 'blockchain', JSON.stringify({ chainId, transactionHash: input.transactionHash })]);
     response.json({ data: { tradeId: trade.publicId, status: 'committed', transactionHash: input.transactionHash, chainId } });
 }));
-api.post('/api/trades/:id/evidence', receiveEvidenceUpload, asyncRoute(async (request, response) => {
+api.post('/api/trades/:id/evidence', requireLinkedWallet, receiveEvidenceUpload, asyncRoute(async (request, response) => {
     const input = z.object({
         quantity: z.coerce.number().positive().max(100_000),
         source: z.string().trim().min(3).max(120),
@@ -398,7 +422,7 @@ api.post('/api/trades/:id/evidence', receiveEvidenceUpload, asyncRoute(async (re
             if (!input.chainTransactionHash)
                 throw new HttpError(409, 'Submit the evidence hash to the configured contract before recording it.', 'CHAIN_EVIDENCE_REQUIRED');
             const receipt = await provider.getTransactionReceipt(input.chainTransactionHash);
-            const event = receipt?.logs.map((log) => { try {
+            const event = receipt?.logs.filter((log) => log.address.toLowerCase() === contractAddress.toLowerCase()).map((log) => { try {
                 return tradingInterface.parseLog(log);
             }
             catch {
@@ -452,7 +476,7 @@ api.get('/api/evidence/:id/file', asyncRoute(async (request, response) => {
     response.setHeader('X-Content-Type-Options', 'nosniff');
     response.send(file.content);
 }));
-api.post('/api/trades/:id/evidence/ai-review', rateLimit({ windowMs: 15 * 60_000, limit: 5, standardHeaders: 'draft-8', legacyHeaders: false }), receiveEvidenceUpload, asyncRoute(async (request, response) => {
+api.post('/api/trades/:id/evidence/ai-review', requireLinkedWallet, rateLimit({ windowMs: 15 * 60_000, limit: 5, standardHeaders: 'draft-8', legacyHeaders: false }), receiveEvidenceUpload, asyncRoute(async (request, response) => {
     if (request.body.consent !== 'true')
         throw new HttpError(400, 'Explicit consent is required before sending a file to the AI provider.', 'AI_REVIEW_CONSENT_REQUIRED');
     const file = request.file;
@@ -476,7 +500,7 @@ api.post('/api/trades/:id/evidence/ai-review', rateLimit({ windowMs: 15 * 60_000
     });
     response.json({ data: { id: saved.id, fileSha256: inspected.sha256, model: result.model, analysis: result.analysis } });
 }));
-api.post('/api/evidence/:id/review', allowRoles('verifier', 'admin'), asyncRoute(async (request, response) => {
+api.post('/api/evidence/:id/review', requireLinkedWallet, allowRoles('verifier', 'admin'), asyncRoute(async (request, response) => {
     const input = z.object({
         decision: z.enum(['approve', 'reject']),
         reason: z.string().trim().max(500).optional(),
@@ -488,8 +512,11 @@ api.post('/api/evidence/:id/review', allowRoles('verifier', 'admin'), asyncRoute
     if (input.decision === 'reject' && !input.reason)
         throw new HttpError(400, 'A rejection reason is required.', 'REJECTION_REASON_REQUIRED');
     const result = await transaction(async (client) => {
-        const current = await client.query(`SELECT e.id,e.trade_id AS "tradeId",t.public_id AS "tradePublicId",t.buyer_id AS "buyerId",t.seller_id AS "sellerId",e.submitter_id AS "submitterId",e.status,e.quantity_kwh AS quantity
-       FROM evidence e JOIN trades t ON t.id=e.trade_id WHERE e.public_id=$1 FOR UPDATE OF e,t`, [request.params.id]);
+        const current = await client.query(`SELECT e.id,e.trade_id AS "tradeId",t.public_id AS "tradePublicId",t.buyer_id AS "buyerId",t.seller_id AS "sellerId",
+        buyer.wallet_address AS "buyerWallet",t.chain_tx_hash AS "commitTxHash",
+        e.submitter_id AS "submitterId",e.status,e.quantity_kwh AS quantity
+       FROM evidence e JOIN trades t ON t.id=e.trade_id JOIN users buyer ON buyer.id=t.buyer_id
+       WHERE e.public_id=$1 FOR UPDATE OF e,t`, [request.params.id]);
         const evidence = current.rows[0];
         if (!evidence)
             throw new HttpError(404, 'Evidence record not found.', 'EVIDENCE_NOT_FOUND');
@@ -506,7 +533,7 @@ api.post('/api/evidence/:id/review', allowRoles('verifier', 'admin'), asyncRoute
                 throw new HttpError(409, 'Submit the evidence review to the configured contract first.', 'CHAIN_REVIEW_REQUIRED');
             const receipt = await provider.getTransactionReceipt(input.chainTransactionHash);
             const reasonHash = keccak256(toUtf8Bytes(input.reason ?? ''));
-            const event = receipt?.logs.map((log) => { try {
+            const event = receipt?.logs.filter((log) => log.address.toLowerCase() === contractAddress.toLowerCase()).map((log) => { try {
                 return tradingInterface.parseLog(log);
             }
             catch {
@@ -516,6 +543,30 @@ api.post('/api/evidence/:id/review', allowRoles('verifier', 'admin'), asyncRoute
             if (!receipt || receipt.status !== 1 || receipt.to?.toLowerCase() !== contractAddress.toLowerCase() ||
                 receipt.from.toLowerCase() !== request.user.walletAddress?.toLowerCase() || !event) {
                 throw new HttpError(422, 'Confirmed contract review event does not match the requested decision.', 'INVALID_CHAIN_REVIEW');
+            }
+            if (chainId === 11155111 && input.decision === 'reject') {
+                if (!evidence.commitTxHash)
+                    throw new HttpError(409, 'The escrow commitment transaction is missing.', 'CHAIN_COMMITMENT_REQUIRED');
+                const commitmentReceipt = await provider.getTransactionReceipt(evidence.commitTxHash);
+                const commitment = commitmentReceipt?.logs.filter((log) => log.address.toLowerCase() === contractAddress.toLowerCase())
+                    .map((log) => { try {
+                    return tradingInterface.parseLog(log);
+                }
+                catch {
+                    return null;
+                } })
+                    .find((item) => item?.name === 'TradeCommitted' && item.args.tradeId === keccak256(toUtf8Bytes(evidence.tradePublicId)));
+                const refund = receipt.logs.filter((log) => log.address.toLowerCase() === contractAddress.toLowerCase()).map((log) => { try {
+                    return tradingInterface.parseLog(log);
+                }
+                catch {
+                    return null;
+                } })
+                    .find((item) => item?.name === 'TradePaymentRefunded' && item.args.tradeId === keccak256(toUtf8Bytes(evidence.tradePublicId)));
+                if (!commitment || !refund || getAddress(refund.args.buyer) !== getAddress(evidence.buyerWallet) ||
+                    BigInt(refund.args.amountWei) !== BigInt(commitment.args.paymentWei)) {
+                    throw new HttpError(422, 'Rejected evidence transaction did not refund escrow to the buyer.', 'INVALID_CHAIN_REFUND');
+                }
             }
         }
         await client.query('UPDATE evidence SET status=$2,reviewer_id=$3,rejection_reason=$4,reviewed_at=now(),chain_tx_hash=$5 WHERE id=$1', [evidence.id, status, request.user.id, input.reason ?? null, input.chainTransactionHash ?? null]);
@@ -530,13 +581,17 @@ api.post('/api/evidence/:id/review', allowRoles('verifier', 'admin'), asyncRoute
     });
     response.json({ data: result });
 }));
-api.post('/api/trades/:id/settle', asyncRoute(async (request, response) => {
+api.post('/api/trades/:id/settle', requireLinkedWallet, asyncRoute(async (request, response) => {
     if (request.user.demoKey && request.body?.chainTransactionHash) {
         throw new HttpError(400, 'Demo profiles cannot attach unverified wallet transaction receipts.', 'DEMO_CHAIN_ACTION_UNAVAILABLE');
     }
     const chainBacked = Boolean(contractAddress && !request.user.demoKey);
     const settlement = await transaction(async (client) => {
-        const tradeResult = await client.query('SELECT id,public_id AS "publicId",buyer_id AS "buyerId",seller_id AS "sellerId",quantity_kwh AS quantity,status FROM trades WHERE public_id=$1 FOR UPDATE', [request.params.id]);
+        const tradeResult = await client.query(`SELECT t.id,t.public_id AS "publicId",t.buyer_id AS "buyerId",t.seller_id AS "sellerId",
+        buyer.wallet_address AS "buyerWallet",seller.wallet_address AS "sellerWallet",
+        t.chain_tx_hash AS "commitTxHash",t.quantity_kwh AS quantity,t.status
+       FROM trades t JOIN users buyer ON buyer.id=t.buyer_id JOIN users seller ON seller.id=t.seller_id
+       WHERE t.public_id=$1 FOR UPDATE OF t`, [request.params.id]);
         const trade = tradeResult.rows[0];
         if (!trade)
             throw new HttpError(404, 'Trade not found.', 'TRADE_NOT_FOUND');
@@ -555,15 +610,41 @@ api.post('/api/trades/:id/settle', asyncRoute(async (request, response) => {
         if (chainBacked && request.body.chainTransactionHash) {
             const receipt = await provider.getTransactionReceipt(request.body.chainTransactionHash);
             const expectedTradeId = keccak256(toUtf8Bytes(trade.publicId));
-            const settledEvent = receipt?.logs.map((log) => { try {
+            const settledEvent = receipt?.logs.filter((log) => log.address.toLowerCase() === contractAddress.toLowerCase()).map((log) => { try {
                 return tradingInterface.parseLog(log);
             }
             catch {
                 return null;
             } }).find((event) => event?.name === 'TradeSettled' && event.args.tradeId === expectedTradeId);
             if (!receipt || receipt.status !== 1 || receipt.to?.toLowerCase() !== contractAddress.toLowerCase() ||
-                receipt.from.toLowerCase() !== request.user.walletAddress?.toLowerCase() || !settledEvent) {
+                receipt.from.toLowerCase() !== request.user.walletAddress?.toLowerCase() || !settledEvent ||
+                getAddress(settledEvent.args.buyer) !== getAddress(trade.buyerWallet) ||
+                getAddress(settledEvent.args.seller) !== getAddress(trade.sellerWallet)) {
                 throw new HttpError(422, 'Confirmed contract settlement event was not found or was sent by a different wallet.', 'INVALID_CHAIN_SETTLEMENT');
+            }
+            if (chainId === 11155111) {
+                if (!trade.commitTxHash)
+                    throw new HttpError(409, 'The escrow commitment transaction is missing.', 'CHAIN_COMMITMENT_REQUIRED');
+                const commitmentReceipt = await provider.getTransactionReceipt(trade.commitTxHash);
+                const commitment = commitmentReceipt?.logs.filter((log) => log.address.toLowerCase() === contractAddress.toLowerCase())
+                    .map((log) => { try {
+                    return tradingInterface.parseLog(log);
+                }
+                catch {
+                    return null;
+                } })
+                    .find((event) => event?.name === 'TradeCommitted' && event.args.tradeId === expectedTradeId);
+                const payment = receipt.logs.filter((log) => log.address.toLowerCase() === contractAddress.toLowerCase()).map((log) => { try {
+                    return tradingInterface.parseLog(log);
+                }
+                catch {
+                    return null;
+                } })
+                    .find((event) => event?.name === 'TradePaymentReleased' && event.args.tradeId === expectedTradeId);
+                if (!commitment || !payment || getAddress(payment.args.seller) !== getAddress(trade.sellerWallet) ||
+                    BigInt(payment.args.amountWei) !== BigInt(commitment.args.paymentWei)) {
+                    throw new HttpError(422, 'Confirmed settlement transaction did not release escrowed ETH to the seller.', 'INVALID_CHAIN_PAYMENT');
+                }
             }
         }
         const points = Math.max(1, Math.floor(Number(trade.quantity) * 10));
@@ -800,7 +881,7 @@ api.get('/api/matches', asyncRoute(async (request, response) => {
 api.use((_request, _response, next) => next(new HttpError(404, 'API endpoint not found.', 'NOT_FOUND')));
 api.use(errorHandler);
 export async function startServer() {
-    const port = Number(process.env.API_PORT ?? 4000);
+    const port = Number(process.env.PORT ?? process.env.API_PORT ?? 4000);
     return api.listen(port, '0.0.0.0', () => console.log(`Bright Ledger API listening on :${port}`));
 }
 async function writeAudit(client, actorId, eventType, entityType, entityId, metadata = {}) {
