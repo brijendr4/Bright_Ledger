@@ -948,10 +948,13 @@ function App() {
       return
     }
     let reason = isDisputeResolution ? undefined : evidence.reason
-    if (decision === 'Rejected' && !reason) {
-      const suppliedReason = window.prompt(isBuyerReview ? 'Explain why you are opening a trade dispute:' : 'Add a reason for resolving this dispute in the seller’s favor or refunding the buyer:')
+    if (decision === 'Rejected' && isBuyerReview) {
+      if (!window.confirm('Open a dispute for this delivery evidence? Escrow will remain locked until an authorized verifier resolves it.')) return
+      reason = 'Buyer disputes the submitted delivery evidence.'
+    } else if (decision === 'Rejected' && !reason) {
+      const suppliedReason = window.prompt('Add a reason for resolving this dispute in the seller’s favor or refunding the buyer:')
       if (!suppliedReason?.trim()) {
-        notify('A reason is required.')
+        notify('A reason is required to resolve a dispute.')
         return
       }
       reason = suppliedReason.trim()

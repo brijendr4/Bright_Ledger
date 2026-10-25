@@ -11,6 +11,8 @@ const abi = [
   'function raiseDispute(bytes32 tradeId,bytes32 evidenceHash,bytes32 reasonHash)',
   'function resolveDispute(bytes32 tradeId,bool approved,bytes32 reasonHash)',
   'function settleTrade(bytes32 tradeId)',
+  'function getTrade(bytes32 tradeId) view returns (tuple(address buyer,address seller,uint64 energyWh,uint128 pricePerKWhScaled,uint8 status,bytes32 evidenceHash))',
+  'function escrowedWei(bytes32 tradeId) view returns (uint256)',
 ]
 
 async function contractContext() {
@@ -31,15 +33,57 @@ async function contractContext() {
     throw new Error('The selected wallet does not match the EVM wallet linked to this Bright Ledger account.')
   }
   const contract = new Contract(chain.contractAddress, abi, signer)
-  return { chain, contract }
+  return { chain, contract, walletAddress: signer.address }
 }
 
-async function sendContract(method: string, args: readonly unknown[], overrides?: { value: bigint }) {
-  const { contract } = await contractContext()
+async function sendContractCall(
+  contract: Awaited<ReturnType<typeof contractContext>>['contract'],
+  method: string,
+  args: readonly unknown[],
+  overrides?: { value: bigint },
+) {
   const transaction = await contract.getFunction(method)(...args, ...(overrides ? [overrides] : []))
   const receipt = await transaction.wait()
   if (!receipt || receipt.status !== 1) throw new Error('The wallet transaction did not confirm successfully.')
   return receipt.hash
+}
+
+async function sendContract(method: string, args: readonly unknown[], overrides?: { value: bigint }) {
+  const { contract } = await contractContext()
+  return sendContractCall(contract, method, args, overrides)
+}
+
+async function validateBuyerReview(
+  tradeId: string,
+  evidenceHash: string,
+  context: Awaited<ReturnType<typeof contractContext>>,
+) {
+  const { id, ZeroAddress, ZeroHash, getAddress } = await import('ethers')
+  const hash = id(tradeId)
+  const [trade] = await context.contract.getFunction('getTrade')(hash) as [{
+    buyer: string
+    status: bigint
+    evidenceHash: string
+  }]
+  if (trade.buyer === ZeroAddress) {
+    throw new Error(`Trade ${tradeId} has no escrow commitment on the configured contract. Confirm the buyer funded this exact trade on the current contract.`)
+  }
+  if (getAddress(trade.buyer) !== getAddress(context.walletAddress)) {
+    throw new Error(`The connected wallet is not the buyer recorded for trade ${tradeId}.`)
+  }
+  if (Number(trade.status) !== 1) {
+    const status = ['not found', 'awaiting delivery review', 'evidence submitted', 'approved', 'disputed', 'settled', 'refunded'][Number(trade.status)] ?? 'in an unknown state'
+    throw new Error(`Trade ${tradeId} is ${status} on-chain and cannot be approved or disputed again.`)
+  }
+  if (evidenceHash === ZeroHash) {
+    throw new Error('The evidence record has no valid hash. Refresh the page and select the evidence again.')
+  }
+  if (context.chain.paymentsEnabled) {
+    const escrow = await context.contract.getFunction('escrowedWei')(hash) as bigint
+    if (escrow === 0n) {
+      throw new Error(`Trade ${tradeId} has no escrow remaining on this contract. Do not retry until you verify its commitment transaction.`)
+    }
+  }
 }
 
 export async function getTradePaymentQuote(trade: { quantity: number; price: number }) {
@@ -82,12 +126,16 @@ export async function commitTradeOnChain(trade: {
 
 export async function approveEvidenceOnChain(tradeId: string, evidenceHash: string) {
   const { id } = await import('ethers')
-  return sendContract('approveEvidenceAndSettle', [id(tradeId), evidenceHash])
+  const context = await contractContext()
+  await validateBuyerReview(tradeId, evidenceHash, context)
+  return sendContractCall(context.contract, 'approveEvidenceAndSettle', [id(tradeId), evidenceHash])
 }
 
 export async function raiseDisputeOnChain(tradeId: string, evidenceHash: string, reason: string) {
   const { id, keccak256, toUtf8Bytes } = await import('ethers')
-  return sendContract('raiseDispute', [id(tradeId), evidenceHash, keccak256(toUtf8Bytes(reason))])
+  const context = await contractContext()
+  await validateBuyerReview(tradeId, evidenceHash, context)
+  return sendContractCall(context.contract, 'raiseDispute', [id(tradeId), evidenceHash, keccak256(toUtf8Bytes(reason))])
 }
 
 export async function resolveDisputeOnChain(tradeId: string, approved: boolean, reason: string) {
