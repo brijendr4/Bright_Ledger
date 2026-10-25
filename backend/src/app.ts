@@ -598,15 +598,14 @@ api.post('/api/evidence/:id/review', requireLinkedWallet, asyncRoute(async (requ
   const result = await transaction(async (client) => {
     const current = await client.query<{
       id: string; tradeId: string; tradePublicId: string; buyerId: string; sellerId: string;
-      buyerWallet: string; sellerWallet: string; commitTxHash: string | null;
+      commitTxHash: string | null;
       submitterId: string; evidenceStatus: string; tradeStatus: string; quantity: string; evidenceHash: string;
     }>(
       `SELECT e.id,e.trade_id AS "tradeId",t.public_id AS "tradePublicId",t.buyer_id AS "buyerId",t.seller_id AS "sellerId",
-        buyer.wallet_address AS "buyerWallet",seller.wallet_address AS "sellerWallet",t.chain_tx_hash AS "commitTxHash",
+        t.chain_tx_hash AS "commitTxHash",
         e.submitter_id AS "submitterId",e.status AS "evidenceStatus",t.status AS "tradeStatus",
         e.quantity_kwh AS quantity,e.evidence_hash AS "evidenceHash"
        FROM evidence e JOIN trades t ON t.id=e.trade_id
-       JOIN users buyer ON buyer.id=t.buyer_id JOIN users seller ON seller.id=t.seller_id
        WHERE e.public_id=$1 FOR UPDATE OF e,t`,
       [routeId(request)],
     )
@@ -643,7 +642,17 @@ api.post('/api/evidence/:id/review', requireLinkedWallet, asyncRoute(async (requ
       const settled = findTradeEvent(receipt, 'TradeSettled', tradeHash)
       const released = findTradeEvent(receipt, 'TradePaymentReleased', tradeHash)
       const refunded = findTradeEvent(receipt, 'TradePaymentRefunded', tradeHash)
-      const expectedSender = isBuyer ? evidence.buyerWallet : request.user!.walletAddress
+      if (!evidence.commitTxHash) {
+        throw new HttpError(409, 'The trade commitment transaction is missing. Contact support before approving this trade.', 'CHAIN_COMMITMENT_REQUIRED')
+      }
+      const commitmentReceipt = await provider.getTransactionReceipt(evidence.commitTxHash)
+      const commitment = findTradeEvent(commitmentReceipt, 'TradeCommitted', tradeHash)
+      const committedBuyer = commitment?.args.buyer
+      const committedSeller = commitment?.args.seller
+      if (!commitment || typeof committedBuyer !== 'string' || typeof committedSeller !== 'string') {
+        throw new HttpError(409, 'The original trade participants could not be verified from the commitment transaction.', 'INVALID_CHAIN_COMMITMENT')
+      }
+      const expectedSender = isBuyer ? committedBuyer : request.user!.walletAddress
       const expectedReasonHash = isBuyer && input.decision === 'approve' ? `0x${'0'.repeat(64)}` : reasonHash
       if (!receipt || !chainTransaction || receipt.status !== 1 ||
         receipt.to?.toLowerCase() !== contractAddress.toLowerCase() ||
@@ -657,24 +666,20 @@ api.post('/api/evidence/:id/review', requireLinkedWallet, asyncRoute(async (requ
         throw new HttpError(422, 'The buyer decision is not bound to the submitted evidence record.', 'INVALID_CHAIN_EVIDENCE')
       }
       if (input.decision === 'approve' && (!settled ||
-        getAddress(settled.args.buyer) !== getAddress(evidence.buyerWallet) ||
-        getAddress(settled.args.seller) !== getAddress(evidence.sellerWallet))) {
+        getAddress(settled.args.buyer) !== getAddress(committedBuyer) ||
+        getAddress(settled.args.seller) !== getAddress(committedSeller))) {
         throw new HttpError(422, 'The approved evidence transaction did not settle this trade.', 'INVALID_CHAIN_SETTLEMENT')
       }
       if (chainId === 11155111 && input.decision === 'approve') {
-        if (!evidence.commitTxHash) throw new HttpError(409, 'The buyer escrow transaction is missing.', 'CHAIN_COMMITMENT_REQUIRED')
-        const commitment = findTradeEvent(await provider.getTransactionReceipt(evidence.commitTxHash), 'TradeCommitted', tradeHash)
         if (!commitment || !released ||
-          getAddress(released.args.seller) !== getAddress(evidence.sellerWallet) ||
+          getAddress(released.args.seller) !== getAddress(committedSeller) ||
           BigInt(released.args.amountWei) !== BigInt(commitment.args.paymentWei)) {
           throw new HttpError(422, 'The transaction did not release the full escrow to the seller.', 'INVALID_CHAIN_PAYMENT')
         }
       }
       if (resolvingDispute && input.decision === 'reject' && chainId === 11155111) {
-        if (!evidence.commitTxHash) throw new HttpError(409, 'The buyer escrow transaction is missing.', 'CHAIN_COMMITMENT_REQUIRED')
-        const commitment = findTradeEvent(await provider.getTransactionReceipt(evidence.commitTxHash), 'TradeCommitted', tradeHash)
         if (!commitment || !refunded ||
-          getAddress(refunded.args.buyer) !== getAddress(evidence.buyerWallet) ||
+          getAddress(refunded.args.buyer) !== getAddress(committedBuyer) ||
           BigInt(refunded.args.amountWei) !== BigInt(commitment.args.paymentWei)) {
           throw new HttpError(422, 'The dispute resolution did not refund the full escrow to the buyer.', 'INVALID_CHAIN_REFUND')
         }
@@ -687,7 +692,7 @@ api.post('/api/evidence/:id/review', requireLinkedWallet, asyncRoute(async (requ
       ? 'disputed'
       : hasContract
         ? input.decision === 'approve' ? 'settled' : 'refunded'
-        : input.decision === 'approve' ? 'ready_to_settle' : 'cancelled'
+        : input.decision === 'approve' ? 'settled' : 'cancelled'
     await client.query(
       'UPDATE evidence SET status=$2,reviewer_id=$3,rejection_reason=$4,reviewed_at=now(),chain_tx_hash=$5 WHERE id=$1',
       [evidence.id, evidenceStatus, isBuyer ? null : request.user!.id, input.reason ?? null, input.chainTransactionHash ?? null],
@@ -963,7 +968,9 @@ api.post('/api/projects/:id/contributions', asyncRoute(async (request, response)
     )
     const row = project.rows[0]
     if (!row) throw new HttpError(404, 'Project not found.', 'PROJECT_NOT_FOUND')
-    if (row.status !== 'funding') throw new HttpError(409, 'This project is not accepting pledges.', 'PROJECT_NOT_FUNDING')
+    if (!['review', 'funding'].includes(row.status)) {
+      throw new HttpError(409, 'This project is not accepting simulated interest in its current status.', 'PROJECT_NOT_ACCEPTING_INTEREST')
+    }
     const raisedResult = await client.query<{ raised: string }>(
       "SELECT coalesce(sum(amount),0) AS raised FROM contributions WHERE project_id=$1 AND status IN ('simulated','confirmed','pledged')",
       [row.id],

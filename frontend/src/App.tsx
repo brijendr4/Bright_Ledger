@@ -127,7 +127,7 @@ const tourSteps: { page: Page; target: string; title: string; description: strin
   { page: 'Energy market', target: '.segmented-tabs', title: 'Compare offers and requests', description: 'Switch between Energy offers and Buy requests. Compare each listing’s quantity, seller-set USD/kWh price, area, source, and delivery window before proposing a match.' },
   { page: 'My offers', target: 'offer-form', title: 'Create an energy offer', description: 'Choose Offer, then enter available energy in kWh, your asking price in USD/kWh, city and country, renewable source, and delivery window. The price is your choice; Bright Ledger does not calculate it.' },
   { page: 'My requests', target: 'request-form', title: 'Post a buyer request', description: 'Choose Request, then enter the energy quantity you need, the maximum USD/kWh you are willing to pay, your area, source preference, and delivery window. Matching is based on the listing terms.' },
-  { page: 'Trades', target: '.trade-flow', title: 'Follow the trade workflow', description: 'Both participants confirm terms. The buyer funds configured escrow, the seller submits delivery evidence, and the buyer approves release or opens a dispute for verifier resolution.' },
+  { page: 'Trades', target: '.trade-flow', title: 'Follow the trade workflow', description: 'Both participants confirm terms. The buyer funds configured escrow, the seller submits delivery evidence, and the buyer approves to complete the trade or opens a dispute.' },
   { page: 'Evidence', target: 'evidence', title: 'Submit and review evidence', description: 'The seller reports delivered kWh, selects a reading source and interval, and can attach meter or inverter evidence. The buyer reviews the record; AI checks are advisory only.' },
   { page: 'Solar projects', target: 'projects', title: 'Submit a community solar site', description: 'Add the site name, location, site type, usable area, permission status, notes, and an illustrative funding target. The capacity estimate is approximate; submissions need review and contributions are simulated.' },
 ]
@@ -1015,11 +1015,11 @@ function App() {
     } else if (isDisputeResolution) {
       notify(chainEnabled
         ? 'Dispute resolved for the seller and the trade record settled on-chain; this network has no native escrow.'
-        : 'Dispute resolved for the seller. The trade record is ready to settle; no funds move in this deployment.')
+        : 'Dispute resolved for the seller and trade completed. No funds moved in this deployment.')
     } else if (chainEnabled) {
       notify('Delivery approved and the trade record settled on-chain; this network has no native escrow.')
     } else {
-      notify('Delivery approved. The trade record is ready to settle; no funds move in this deployment.')
+      notify('Trade completed after buyer approval. Both participants can see the completed status; no funds moved.')
     }
   }
 
@@ -1679,13 +1679,13 @@ function Trades({ trades, statusFilter, setStatusFilter, state, role, walletAddr
       <div className="mini-stat"><span>Energy exchanged</span><b>{state.trades.filter((trade) => trade.status === 'Settled').reduce((sum, trade) => sum + trade.quantity, 0).toFixed(1)} <em>kWh</em></b><small>Settled records</small></div>
     </div>
     <section className="panel list-page-panel">
-      <div className="panel-heading"><div><span className="section-kicker">AUDITABLE BY DESIGN</span><h2>Trade activity</h2><p>Buyer funds escrow; seller submits delivery evidence; buyer approves release or opens a dispute.</p></div>
+      <div className="panel-heading"><div><span className="section-kicker">AUDITABLE BY DESIGN</span><h2>Trade activity</h2>      <p>The seller submits delivery evidence; the buyer approves to complete the trade or opens a dispute.</p></div>
         <div className="filter-select-wrap"><Filter size={14} /><select aria-label="Filter trades by status" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option>All status</option><option>Awaiting confirmation</option><option>Awaiting buyer escrow</option><option>Evidence needed</option><option>Under review</option><option>Ready to settle</option><option>Disputed</option><option>Settled</option><option>Refunded</option></select><ChevronDown size={13} /></div>
       </div>
       {trades.length === 0
         ? <div className="empty-state"><Activity size={26} /><h3>No trades match this view</h3><p>Change the filter to see your market activity.</p></div>
         : <div className="responsive-table"><table className="data-table"><thead><tr><th>Trade ID</th><th>Participants</th><th>Energy</th><th>Unit price</th><th>Last update</th><th>Status</th><th>Next step</th></tr></thead><tbody>{trades.map((trade) => <tr key={trade.id}><td><b>{trade.id}</b><small><button className="hash-copy" onClick={() => onCopy(trade.hash)}><Copy size={11} /> {trade.hash}</button></small></td><td><span className="participants">{trade.buyer}<small>↔</small>{trade.seller}</span></td><td><b>{trade.quantity} kWh</b></td><td>${trade.price.toFixed(2)}</td><td>{trade.time}</td><td><Status status={trade.status} /></td><td>{nextStep(trade)}</td></tr>)}</tbody></table></div>}
-      <div className="trade-flow"><span className="flow-step active"><i>1</i>Confirm terms</span><span className="flow-connector" /><span className="flow-step active"><i>2</i>{chainPaymentsEnabled ? 'Buyer funds escrow' : 'Buyer commitment'}</span><span className="flow-connector" /><span className="flow-step"><i>3</i>Seller delivers</span><span className="flow-connector" /><span className="flow-step"><i>4</i>Buyer approves / disputes</span></div>
+      <div className="trade-flow"><span className="flow-step active"><i>1</i>Both confirm terms</span><span className="flow-connector" /><span className="flow-step active"><i>2</i>{chainPaymentsEnabled ? 'Buyer funds escrow' : 'Buyer commitment'}</span><span className="flow-connector" /><span className="flow-step"><i>3</i>Seller submits evidence</span><span className="flow-connector" /><span className="flow-step"><i>4</i>Buyer approves to complete</span></div>
     </section>
     <div className="helper-note"><ShieldCheck size={16} /><span>{chainPaymentsEnabled ? 'Only the buyer sends Sepolia escrow. Delivery evidence is not a payment transaction; a dispute keeps escrow locked.' : 'This deployment records trade decisions without moving funds. Delivery evidence is never a payment transaction.'}</span></div>
   </div>
@@ -1892,9 +1892,10 @@ function Projects({ projects, contributions, filter, setFilter, onFund, onCreate
         <div className="project-card-body"><div className="project-location"><span><Sun size={13} /> {project.location}</span><Status status={project.status} /></div>
           <h3>{project.name}</h3><p title={project.notes}>Project Owner: {project.owner} · {project.siteType}</p><span className="project-permission"><ShieldCheck size={12} /> {project.permission}</span>
           <div className="project-metrics"><div><span>Estimated capacity</span><b>{project.capacity} <small>kW</small></b></div><div><span>Available area</span><b>{project.area} <small>m²</small></b></div><div><span>Funding goal</span><b>{formatUSD(project.target)}</b></div></div>
-          <div className="funding-progress-head"><span>Your recorded interests · {contributions.filter((item) => item.projectId === project.id).length}</span><b>{pct(project.raised, project.target)}%</b></div><div className="progress-track"><i style={{ width: `${pct(project.raised, project.target)}%` }} /></div>
-          <div className="funding-amount"><span>{formatUSD(project.raised)} <small>contributed</small></span><span>{formatUSD(project.target - project.raised)} <small>remaining</small></span></div>
-          <button className="button button-secondary project-action" disabled={project.status !== 'Funding'} onClick={() => onFund(project)}>{project.status === 'Review' || project.status === 'Draft' ? 'Awaiting project approval' : project.raised >= project.target ? 'Funding goal reached' : project.status === 'Funding' ? 'Register investor interest' : 'Funding unavailable'} <ArrowRight size={15} /></button>
+          <div className="funding-progress-head"><span>Recorded simulated interests · {contributions.filter((item) => item.projectId === project.id).length}</span><b>{pct(project.raised, project.target)}%</b></div><div className="progress-track"><i style={{ width: `${pct(project.raised, project.target)}%` }} /></div>
+          <div className="funding-amount"><span>{formatUSD(project.raised)} <small>interest recorded</small></span><span>{formatUSD(project.target - project.raised)} <small>goal remaining</small></span></div>
+          <button className="button button-secondary project-action" disabled={!['Review', 'Funding'].includes(project.status) || project.raised >= project.target} onClick={() => onFund(project)}>{project.raised >= project.target ? 'Interest goal reached' : project.status === 'Review' ? 'Register interest · pending review' : project.status === 'Funding' ? 'Register investor interest' : 'Interest unavailable'} <ArrowRight size={15} /></button>
+          {project.status === 'Review' && <small className="project-review-interest-note">Interest is simulated only. Independent approval is still required before fundraising can proceed.</small>}
           {['Funding', 'Operational'].includes(project.status) && <details className="project-income-panel">
             <summary>Record simulated income & allocate</summary>
             <p>Enter a prototype income amount. Bright Ledger allocates it by the project agreement and records the result; it does not collect or pay money.</p>
@@ -2158,15 +2159,15 @@ function Modal({ kind, onClose, onListing, onProject, onEstimateProject, onMatch
       {evidence.evidenceFileSha256 && <div className="evidence-file-hash">File SHA-256: <code>{evidence.evidenceFileSha256}</code></div>}
       {evidence.reason && <div className="rejection-reason">{evidence.status === 'Disputed' ? 'Buyer dispute reason' : 'Review note'}: {evidence.reason}</div>}
       {evidence.aiReview && <div className="ai-review-result"><b>AI advisory review · {evidence.aiReview.analysis.confidence} confidence</b><p>{evidence.aiReview.analysis.summary}</p>{evidence.aiReview.analysis.flags.length > 0 && <div><span>Potential issues to inspect</span><ul>{evidence.aiReview.analysis.flags.map((flag) => <li key={flag}>{flag}</li>)}</ul></div>}<div><span>Suggested human checks</span><ul>{evidence.aiReview.analysis.suggestedChecks.map((check) => <li key={check}>{check}</li>)}</ul></div><small>{evidence.aiReview.model} · advisory only · review ID {evidence.aiReview.id}</small></div>}
-      <div className="match-term-row"><span>Review state</span><b className="provenance"><ShieldCheck size={14} /> {evidence.status === 'Approved' ? 'Buyer approved delivery' : evidence.status === 'Rejected' ? 'Dispute resolved for buyer' : evidence.status === 'Disputed' ? 'Dispute open · escrow remains locked' : 'Awaiting buyer review'}</b></div>
+      <div className="match-term-row"><span>Review state</span><b className="provenance"><ShieldCheck size={14} /> {evidence.status === 'Approved' ? trade?.status === 'Settled' ? 'Trade complete · buyer approved delivery' : 'Buyer approved delivery' : evidence.status === 'Rejected' ? 'Dispute resolved for buyer' : evidence.status === 'Disputed' ? 'Dispute open · escrow remains locked' : 'Awaiting buyer review'}</b></div>
       <div className="modal-disclosure">{evidence.status === 'Disputed'
         ? chainPaymentsEnabled ? 'An authorized verifier resolves the appeal by releasing escrow to the seller or refunding it to the buyer.' : 'An authorized verifier resolves the appeal for the buyer or seller. This deployment does not move funds.'
-        : chainPaymentsEnabled ? 'The buyer can approve delivery to release escrow or open a dispute. Evidence upload itself never moves funds.' : 'The buyer can approve delivery or open a dispute. This deployment records decisions without moving funds.'}</div>
+        : chainPaymentsEnabled ? 'The seller submits delivery evidence. The buyer approves it to release escrow and complete the trade, or opens a dispute. Evidence upload itself never moves funds.' : 'The seller submits delivery evidence. The buyer approves it to complete the trade or opens a dispute. Approval updates the shared record; no money moves.'}</div>
       <div className="modal-actions">
         {evidence.status === 'Pending' && evidence.buyerCanReview && <><button className="button button-danger-outline" onClick={() => onReview(evidence, 'Rejected')}>Open dispute</button><button className="button button-approve" onClick={() => onReview(evidence, 'Approved')}><Check size={15} /> {chainPaymentsEnabled ? 'Approve & release escrow' : 'Approve delivery'}</button></>}
         {evidence.status === 'Pending' && !evidence.buyerCanReview && <span className="permission-note"><ShieldCheck size={14} /> Waiting for the buyer to review</span>}
         {evidence.status === 'Disputed' && (role === 'Verifier' || role === 'Admin') && <><button className="button button-danger-outline" onClick={() => onReview(evidence, 'Rejected')}>{chainPaymentsEnabled ? 'Refund buyer' : 'Resolve for buyer'}</button><button className="button button-approve" onClick={() => onReview(evidence, 'Approved')}><Check size={15} /> {chainPaymentsEnabled ? 'Release to seller' : 'Resolve for seller'}</button></>}
-        {evidence.status === 'Approved' && trade?.status === 'Ready to settle' && <button className="button button-primary" onClick={() => { onSettle(trade); onClose() }}>Settle trade record <ArrowRight size={14} /></button>}
+        {evidence.status === 'Approved' && trade?.status === 'Ready to settle' && <button className="button button-primary" onClick={() => { onSettle(trade); onClose() }}>Complete trade <ArrowRight size={14} /></button>}
         {(evidence.status === 'Rejected' || (evidence.status === 'Disputed' && role !== 'Verifier' && role !== 'Admin') || (evidence.status === 'Approved' && trade?.status !== 'Ready to settle')) && <button className="button button-outline" onClick={onClose}>Close</button>}
       </div>
     </div>}
