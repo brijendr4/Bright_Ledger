@@ -2,9 +2,9 @@
 
 ## 1. Purpose and scope
 
-This document is the deployment plan for the Bright Ledger project. It consolidates the repository’s existing architecture, local Docker workflow, backend/frontend deployment targets, environment variables, security rules, observability expectations, rollback procedure, and validation gates.
+This document is the deployment plan for the Bright Ledger project. It consolidates the repository’s existing architecture, local Docker workflow, SmarterASP.NET hosting target, environment variables, security rules, observability expectations, rollback procedure, and validation gates.
 
-The plan is intentionally practical and implementation-aware. It is based on the current repository configuration and validated commands, not a generic cloud deployment checklist.
+The plan is intentionally practical and implementation-aware. The hosting steps are provider-neutral where the host control panel and selected plan have not been verified.
 
 ## 2. Deployment summary
 
@@ -17,8 +17,7 @@ Bright Ledger is structured as a monorepo with three main runtime areas:
 The project is designed for:
 
 - Local development via Docker Compose
-- Separate deployment of the API to Render
-- Separate deployment of the frontend to Vercel
+- Separate deployment of the API and static frontend to SmarterASP.NET, subject to selected-plan compatibility
 - Local blockchain development using Hardhat and a local EVM
 - Production-like staging configuration using distinct environment variables and host-managed secrets
 
@@ -41,14 +40,7 @@ The root `Dockerfile` builds the full monorepo and exposes ports:
 - 8545
 
 ### 3.2 Backend deploy target
-The `render.yaml` file declares a Node web service:
-
-- Service: `bright-ledger-api`
-- Runtime: Node
-- Root directory: `backend`
-- Build command: `npm ci && npm run build`
-- Start command: `npm start`
-- Health check path: `/api/health`
+The backend is a standalone Node.js service in `backend/`:
 
 This matches the backend package script setup in `backend/package.json`:
 
@@ -58,17 +50,17 @@ This matches the backend package script setup in `backend/package.json`:
 - `typecheck`: `tsc --noEmit -p tsconfig.json`
 - `test`: `vitest run`
 
-### 3.3 Frontend deploy target
-The `vercel.json` file configures Vercel for the Vite app:
+The intended hosting target is SmarterASP.NET, configured manually in its control panel. Before deploying, confirm the selected plan supports Node.js `>=22.12.0`, a continuously running Express service, and outbound PostgreSQL connections. No provider-specific service manifest is included.
 
-- Build command: `npm run build:frontend`
-- Output directory: `frontend/dist`
-- Framework: `vite`
+### 3.3 Frontend deploy target
+The Vite frontend builds to static files in `frontend/dist`:
 
 This matches the root package scripts:
 
 - `build:frontend`: `npm run build --workspace @bright-ledger/frontend`
 - `preview`: `npm run preview --workspace @bright-ledger/frontend`
+
+Deploy the generated static files using the SmarterASP.NET static-site or web-file hosting option available in the selected plan. Configure `VITE_API_BASE_URL` before building so the client points to the deployed API.
 
 ### 3.4 Blockchain deploy target
 The blockchain package uses Hardhat:
@@ -110,15 +102,15 @@ Notes:
 - The backend reads environment variables from the workspace root or backend folder, depending on runtime context.
 
 ### 4.2 Production deployment variables
-For Render/Vercel infrastructure, configure only the variables that belong in the target runtime:
+For SmarterASP.NET, configure only the variables that belong in each runtime:
 
-Frontend (public-safe only):
+Frontend build (public-safe only):
 
 - `VITE_API_BASE_URL`
 - Public RPC URL if required
 - Public contract address if needed for browser access
 
-Backend (server-side only):
+Backend service (server-side only):
 
 - `DATABASE_URL`
 - `DATABASE_SSL=true`
@@ -164,26 +156,25 @@ Expected runtime:
 
 Goal: make the frontend and backend accessible without requiring a localhost-only setup.
 
-Recommended target architecture:
+Intended target architecture, subject to plan compatibility:
 
-- Frontend: Vercel
-- Backend: Render
-- Database: PostgreSQL service managed by Render or equivalent managed Postgres
+- Frontend: static Vite output on SmarterASP.NET
+- Backend: Node.js API on SmarterASP.NET
+- Database: PostgreSQL service reachable by the backend
 - Smart contracts: testnet or local staging chain as appropriate
 
 Deployment steps:
 
-1. Connect the GitHub repository to Vercel.
-2. Select the "frontend" app root or configure the correct build output and path.
-3. Set environment variables in Vercel for frontend-safe values only.
-4. Deploy the backend to Render with `backend` as the root directory.
-5. Set server-only environment variables in Render.
-6. Ensure CORS allows the deployed frontend origins only.
-7. Verify `/api/health` and the main frontend page on the production-like domain.
+1. Confirm the selected SmarterASP.NET plan supports the Node.js runtime, long-running API process, PostgreSQL connectivity, and static frontend hosting required by this app; verify current free-offer limits with the provider.
+2. Build the frontend with `npm run build:frontend` after setting `VITE_API_BASE_URL`, then publish the contents of `frontend/dist`.
+3. Build the backend from `backend/` with `npm ci && npm run build`, configure its server-side environment variables, and start it with `npm start`.
+4. Configure the PostgreSQL database connection and run the API so its startup migrations can apply.
+5. Ensure CORS allows the deployed frontend origin only.
+6. Verify `/api/health` and the frontend page on their HTTPS domains.
 
 ### Phase 3: Preview and release deployment
 
-Use preview deployments for pull requests. Keep production deployment on the intended branch only.
+Validate changes in a separate staging deployment before updating the production site. Keep production deployment on the intended branch only.
 
 Requirements:
 
@@ -253,22 +244,20 @@ These are mandatory deployment rules for this project:
 
 ### Frontend checklist
 
-- GitHub repo is connected to Vercel
-- Framework preset is Vite
-- Build command is `npm run build:frontend`
-- Output directory is `frontend/dist`
+- Frontend is built with `npm run build:frontend`
+- Static output from `frontend/dist` is published to the configured site
 - Only public-safe config is included
-- Preview and production origins are configured
+- `VITE_API_BASE_URL` points to the deployed API
 - Direct route refresh works
 - HTTPS is enabled
 
 ### Backend checklist
 
-- Render web service uses `backend` as root
-- Build command is `npm ci && npm run build`
+- Selected SmarterASP.NET plan supports Node.js `>=22.12.0` and a continuously running Express service
+- Backend is built from `backend/` with `npm ci && npm run build`
 - Start command is `npm start`
 - Health check path `/api/health` works
-- Database URL is configured on the backend host
+- PostgreSQL is reachable and `DATABASE_URL` is configured on the backend host
 - `API_ORIGIN` and auth values are set correctly
 - `CHAIN_RPC_URL`, `CHAIN_ID`, and `CONTRACT_ADDRESS` are correct
 - OpenRouter key is present only where AI features are enabled
@@ -363,7 +352,7 @@ The workflow intentionally skips pull requests from forks because GitHub does no
 1. Verify local Docker setup and environment variables.
 2. Confirm backend and frontend build commands work.
 3. Run backend logic tests and blockchain tests.
-4. Configure Render for the API and Vercel for the frontend.
+4. Verify selected SmarterASP.NET plan compatibility, then configure the API and static frontend in its control panel.
 5. Set environment-specific secrets for deployment targets.
 6. Validate health endpoints and CORS.
 7. Test wallet-driven flows and chain integration in staging.
@@ -402,13 +391,12 @@ Observed results:
 
 This means the current repository is in a strong state for deployment planning and for a controlled staging release, pending host-specific env configuration and deployment credentials.
 
-## 16. Practical production recommendation
+## 16. Practical hosting recommendation
 
 For the current Bright Ledger project, the cleanest path is:
 
-- Vercel for the frontend
-- Render for the API
-- Postgres service managed by Render or a managed Postgres provider
+- SmarterASP.NET for the frontend and API, only if the selected plan supports the required Node.js runtime and PostgreSQL connectivity
+- A PostgreSQL service reachable by the API
 - Local Hardhat/EVM for development, with testnet deployment only when a network-backed demo is explicitly required
 
-This matches the actual repo structure and the deployment files already present in the project.
+The repository does not contain hosting-provider manifests. Configure deployment manually and confirm current free-plan terms, supported runtimes, database availability, and resource limits with SmarterASP.NET before relying on a free deployment.

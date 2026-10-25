@@ -151,6 +151,7 @@ const explorerAddressUrl = (chainId: number | null, address: string) => {
     8453: 'https://basescan.org',
     42161: 'https://arbiscan.io',
     80002: 'https://amoy.polygonscan.com',
+    84532: 'https://sepolia.basescan.org',
     11155111: 'https://sepolia.etherscan.io',
   }
   const base = chainId === null ? undefined : explorers[chainId]
@@ -163,6 +164,7 @@ const evmNetworkName = (chainId: number) => ({
   8453: 'Base',
   42161: 'Arbitrum One',
   80002: 'Polygon Amoy',
+  84532: 'Base Sepolia',
   11155111: 'Ethereum Sepolia',
   31337: 'Local EVM (development)',
 }[chainId] ?? `EVM network ${chainId}`)

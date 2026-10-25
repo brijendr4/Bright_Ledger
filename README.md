@@ -118,6 +118,27 @@ In MetaMask, add a network with:
 
 Use the wallet signup form in Bright Ledger and approve the connection and message-signature requests in MetaMask. Local Hardhat accounts and funds are for development only; their private keys are public test keys and must never be used on a public network.
 
+### Alchemy RPC demo and Base Sepolia
+
+The Node RPC demo reads Ethereum Mainnet's chain ID and latest block number. From the repository root, copy `.env.example` to `.env` and set `ALCHEMY_API_KEY` to your Alchemy key. The key is loaded by `dotenv`, is read only by Node code, and must never be added to a `VITE_*` variable or committed.
+
+Run the demo with:
+
+```sh
+npm run demo:alchemy --workspace @bright-ledger/backend
+```
+
+It prints JSON containing `chainId` (`1` for Ethereum Mainnet) and `latestBlockNumber`. The block number changes as the network advances. The request uses Alchemy's `eth_chainId` and `eth_blockNumber` JSON-RPC methods; it does not sign or send a transaction.
+
+For Base Sepolia contract deployment, create a separate Alchemy app for Base Sepolia, then set `CHAIN_ID=84532`, `BASE_SEPOLIA_ALCHEMY_API_KEY`, and `DEPLOYER_PRIVATE_KEY` in your local `.env`. Keep `ALCHEMY_API_KEY` for the Ethereum Mainnet demo. `BASE_SEPOLIA_RPC_URL` can override the derived Base Sepolia Alchemy URL. Use a newly created test-only wallet with Base Sepolia test ETH; never use a mainnet wallet key. Deploy from the repository root with:
+
+```sh
+npm run chain:compile
+npm run deploy:base-sepolia --workspace @bright-ledger/blockchain
+```
+
+Copy the printed contract address into the backend deployment's `CONTRACT_ADDRESS`, set its `CHAIN_ID` to `84532`, and set its `BASE_SEPOLIA_ALCHEMY_API_KEY` (or `CHAIN_RPC_URL`) in the hosting provider's server-side environment. Redeploy the backend, then connect the browser wallet to Base Sepolia. The frontend wallet signs Bright Ledger contract transactions; the Alchemy keys are only for server-side RPC access and must not be exposed to the browser. This config supports this app's contract flow, not arbitrary transactions on every dapp.
+
 ### Try the marketplace
 
 1. Create a wallet profile with the **Prosumer** role.
@@ -151,7 +172,7 @@ bright-ledger/
 | Evidence triage | OpenRouter multimodal API (optional, advisory only) |
 | External reference | Optional EIA monthly U.S. retail electricity-price API |
 | Local orchestration | Docker Compose |
-| Hosting configuration | Vercel frontend and Render API blueprints |
+| Hosting configuration | SmarterASP.NET (manual deployment; no provider-specific manifest) |
 
 ### Scale and extension
 
@@ -184,12 +205,14 @@ Use short-lived feature branches and pull requests; keep `main` deployable and a
 
 ## Deployment
 
-- **Frontend:** Vercel can build the Vite application from the repository root. Configure `VITE_API_BASE_URL` with the deployed API's HTTPS origin.
-- **Backend:** the Render blueprint runs the standalone `backend/` package. Configure a managed `DATABASE_URL`, the frontend `API_ORIGIN`, the deployed frontend `AUTH_URI`, the public wallet-signing `AUTH_DOMAIN`, and the `CHAIN_ID`. Add only operator-controlled wallet addresses to `ADMIN_WALLET_ADDRESSES`, `VERIFIER_WALLET_ADDRESSES`, and `SPACE_OWNER_WALLET_ADDRESSES`. Sessions are database-backed; no JWT signing secret is used.
+- **Hosting target:** deploy the Vite frontend as static files and the Express API as a Node.js service on SmarterASP.NET. No provider-specific deployment manifests are included; configure each app and its environment in the hosting control panel.
+- **Before deploying:** verify that the selected SmarterASP.NET plan (including any free offer) supports the backend's Node.js `>=22.12.0` runtime, a continuously running Express app, and connectivity to a PostgreSQL database. Confirm the available database options, HTTPS domains, and resource/usage limits; the app requires PostgreSQL.
+- **Frontend:** build with `npm run build:frontend` and publish `frontend/dist`. Set `VITE_API_BASE_URL` to the deployed API's HTTPS origin before building.
+- **Backend:** build and start the standalone `backend/` package with `npm run build` and `npm start` from `backend/`. Configure `DATABASE_URL`, the frontend `API_ORIGIN`, the deployed frontend `AUTH_URI`, the public wallet-signing `AUTH_DOMAIN`, and the `CHAIN_ID`. Add only operator-controlled wallet addresses to `ADMIN_WALLET_ADDRESSES`, `VERIFIER_WALLET_ADDRESSES`, and `SPACE_OWNER_WALLET_ADDRESSES`. Sessions are database-backed; no JWT signing secret is used.
 - **AI evidence triage:** set `OPENROUTER_API_KEY` and (optionally) `OPENROUTER_MODEL` in the backend host's secret/environment settings. Never expose the key as a `VITE_*` variable. Without a key, the rest of the app works and the API returns a clear AI-not-configured response.
 - **Solar funding review:** the backend calculates USD funding needs from submitted cost categories and contingency, persists the plan, and may request a consented AI advisory and revenue-share proposal. The cost inputs are not independently verified; the AI cannot set or validate the total.
 - **Database:** use a managed PostgreSQL service for hosted environments; account for its connection limits, backups, TLS requirements, and availability characteristics.
-- **Blockchain:** deploy and configure a supported EVM contract and RPC separately before using chain-backed paths outside the local development environment.
+- **Blockchain:** deploy the contract separately and set `CONTRACT_ADDRESS`; `BASE_SEPOLIA_ALCHEMY_API_KEY` supplies the server-side Base Sepolia RPC unless `CHAIN_RPC_URL` overrides it. Set `CHAIN_ID` to the contract's network.
 
 Never commit `.env` files, private keys, API keys, or production credentials. Do not put secrets in `VITE_*` variables.
 

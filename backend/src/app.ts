@@ -45,8 +45,12 @@ function receiveEvidenceUpload(request: express.Request, response: express.Respo
   })
 }
 
-const rpcUrl = process.env.CHAIN_RPC_URL
 const chainId = Number(process.env.CHAIN_ID ?? 31337)
+const rpcUrl = process.env.CHAIN_RPC_URL?.trim() || (
+  chainId === 84532 && process.env.BASE_SEPOLIA_ALCHEMY_API_KEY
+    ? `https://base-sepolia.g.alchemy.com/v2/${process.env.BASE_SEPOLIA_ALCHEMY_API_KEY}`
+    : undefined
+)
 const contractAddress = process.env.CONTRACT_ADDRESS ?? ''
 const provider = rpcUrl ? new JsonRpcProvider(rpcUrl) : null
 const tradingInterface = new Interface([

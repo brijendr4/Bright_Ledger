@@ -43,4 +43,4 @@ The solar funding planner calculates the funding amount from user-entered USD co
 
 Useful root commands: `npm run build:backend`, `npm run typecheck:backend`, and `npm run test:backend`.
 
-For a standalone deployment, this package has its own `package.json` and `package-lock.json`; Render is configured to build and run this folder independently.
+For a standalone deployment, this package has its own `package.json` and `package-lock.json`. Build it with `npm run build` and start it with `npm start` from this folder. SmarterASP.NET deployment settings must be configured in the hosting control panel; verify the selected plan supports this API's Node.js version and PostgreSQL requirements.
