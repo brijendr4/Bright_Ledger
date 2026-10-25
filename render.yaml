@@ -48,7 +48,6 @@ services:
     name: bright-ledger-frontend
     runtime: static
     plan: free
-    region: oregon
     buildCommand: npm ci && npm run build:frontend
     staticPublishPath: ./frontend/dist
     envVars:
