@@ -16,6 +16,7 @@ const baseSepoliaRpcUrl = process.env.BASE_SEPOLIA_RPC_URL || (
     ? `https://base-sepolia.g.alchemy.com/v2/${process.env.BASE_SEPOLIA_ALCHEMY_API_KEY}`
     : undefined
 )
+const sepoliaRpcUrl = process.env.SEPOLIA_RPC_URL || 'https://ethereum-sepolia-rpc.publicnode.com'
 
 export default defineConfig({
   plugins: [hardhatEthers, hardhatMocha],
@@ -33,6 +34,12 @@ export default defineConfig({
         accounts: process.env.DEPLOYER_PRIVATE_KEY ? [process.env.DEPLOYER_PRIVATE_KEY] : [],
       },
     } : {}),
+    sepolia: {
+      type: 'http',
+      url: sepoliaRpcUrl,
+      chainId: 11155111,
+      accounts: process.env.DEPLOYER_PRIVATE_KEY ? [process.env.DEPLOYER_PRIVATE_KEY] : [],
+    },
   },
   test: { mocha: { timeout: 20_000 } },
 })

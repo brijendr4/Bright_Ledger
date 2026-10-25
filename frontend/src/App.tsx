@@ -31,8 +31,9 @@ import {
   X,
   Zap,
 } from 'lucide-react'
-import { apiGet, apiGetBlob, apiPatch, apiPost, apiUpload, ApiError, clearAccessToken, clearLegacyAccessToken, getCurrentUser, hasAccessToken, removeWalletAccountWithSignature, revokeWalletSession, signInWallet } from './lib/api'
-import { commitTradeOnChain, makeEvidenceHash, reviewEvidenceOnChain, settleTradeOnChain, submitEvidenceOnChain } from './lib/chain'
+import { apiGet, apiGetBlob, apiPatch, apiPost, apiUpload, ApiError, authenticatePassword, clearAccessToken, clearLegacyAccessToken, getCurrentUser, hasAccessToken, linkWalletWithSignature, removeWalletAccountWithSignature, revokeWalletSession, signInWallet } from './lib/api'
+import { commitTradeOnChain, getTradePaymentQuote, makeEvidenceHash, reviewEvidenceOnChain, settleTradeOnChain, submitEvidenceOnChain } from './lib/chain'
+import { discoverEvmWallets, getActiveEvmWallet, selectEvmWallet, type EvmWalletInfo } from './lib/wallet'
 import './App.css'
 
 type Page = 'Overview' | 'Energy market' | 'My offers' | 'My requests' | 'Trades' | 'Evidence' | 'Rewards' | 'Solar projects' | 'Activity' | 'Settings'
@@ -224,19 +225,23 @@ function App() {
   const [page, setPage] = useState<Page>('Overview')
   const [authenticatedWorkspace, setAuthenticatedWorkspace] = useState(false)
   const [role, setRole] = useState<Role>('Prosumer')
-  const [authMode, setAuthMode] = useState<'none' | 'wallet'>('none')
+  const [authMode, setAuthMode] = useState<'none' | 'wallet' | 'password'>('none')
   const [apiConnected, setApiConnected] = useState(false)
   const [chainEnabled, setChainEnabled] = useState(false)
+  const [chainPaymentsEnabled, setChainPaymentsEnabled] = useState(false)
   const [apiBusy, setApiBusy] = useState(false)
   const [apiError, setApiError] = useState('')
   const [landingNotice, setLandingNotice] = useState('')
   const [identity, setIdentity] = useState('')
+  const [accountUsername, setAccountUsername] = useState('')
   const [accountId, setAccountId] = useState('')
   const [walletAddress, setWalletAddress] = useState('')
   const [walletChainId, setWalletChainId] = useState<number | null>(null)
   const [configuredChainId, setConfiguredChainId] = useState<number | null>(null)
   const [contractAddress, setContractAddress] = useState<string | null>(null)
   const [walletDisplayName, setWalletDisplayName] = useState('')
+  const [walletProviders, setWalletProviders] = useState<EvmWalletInfo[]>([])
+  const [selectedWalletId, setSelectedWalletId] = useState('')
   const [walletRole, setWalletRole] = useState<'prosumer' | 'consumer' | 'both' | 'funder'>('consumer')
   const [showDisclosure, setShowDisclosure] = useState(() => {
     try { return localStorage.getItem('bright-ledger-prototype-disclosure-v1') !== 'true' } catch { return true }
@@ -271,6 +276,18 @@ function App() {
   const [aiEvidenceLoading, setAiEvidenceLoading] = useState(false)
 
   useEffect(() => {
+    let active = true
+    void discoverEvmWallets().then((wallets) => {
+      if (!active) return
+      setWalletProviders(wallets)
+      if (wallets[0]) setSelectedWalletId(wallets[0].id)
+    }).catch((error: unknown) => {
+      if (active) setApiError(error instanceof Error ? error.message : 'Could not discover browser wallets.')
+    })
+    return () => { active = false }
+  }, [])
+
+  useEffect(() => {
     try {
       clearLegacyAccessToken()
     } catch {
@@ -292,35 +309,23 @@ function App() {
     let cancelled = false
     const initialize = async () => {
       const user = await getCurrentUser()
-      const accounts = window.ethereum
-        ? await window.ethereum.request({ method: 'eth_accounts' })
-        : []
-      const activeAddress = Array.isArray(accounts) && typeof accounts[0] === 'string' ? accounts[0] : ''
-      if (!user.walletAddress || activeAddress.toLowerCase() !== user.walletAddress.toLowerCase()) {
-        clearAccessToken()
-        if (!cancelled) {
-          setAuthenticatedWorkspace(false)
-          setAuthMode('none')
-          setWalletAddress(activeAddress)
-          setApiError('The active wallet does not match this session. Connect and authorize the account again.')
-        }
-        return
-      }
       const userRole: Record<string, Role> = { prosumer: 'Prosumer', consumer: 'Consumer', both: 'Both', verifier: 'Verifier', admin: 'Admin', funder: 'Funder', space_owner: 'Space owner' }
       if (!cancelled) {
         setIdentity(user.displayName)
+        setAccountUsername(user.username ?? '')
         setAccountId(user.id)
-        setWalletAddress(user.walletAddress)
-        setAuthMode('wallet')
+        setWalletAddress(user.walletAddress ?? '')
+        setAuthMode(user.authMethod)
         setRole(userRole[user.role] ?? 'Consumer')
       }
       const [snapshot, config] = await Promise.all([
         apiGet<ApiSnapshot>('/api/bootstrap'),
-        apiGet<{ chain: { enabled: boolean; chainId: number; contractAddress: string | null } }>('/api/config'),
+        apiGet<{ chain: { enabled: boolean; paymentsEnabled: boolean; chainId: number; contractAddress: string | null } }>('/api/config'),
       ])
       if (!cancelled) {
         setState(mapSnapshot(snapshot))
         setChainEnabled(config.chain.enabled)
+        setChainPaymentsEnabled(config.chain.paymentsEnabled)
         setConfiguredChainId(config.chain.enabled ? config.chain.chainId : null)
         setContractAddress(config.chain.enabled ? config.chain.contractAddress : null)
         setApiConnected(true)
@@ -345,6 +350,7 @@ function App() {
           setState(emptyState)
           setAccountId('')
           setIdentity('')
+          setAccountUsername('')
           setWalletAddress('')
         }
         setApiConnected(false)
@@ -360,32 +366,21 @@ function App() {
     if (!hasAccessToken()) return
     let cancelled = false
     setApiBusy(true)
-    void getCurrentUser().then(async (user) => {
-      const accounts = window.ethereum
-        ? await window.ethereum.request({ method: 'eth_accounts' })
-        : []
-      const activeAddress = Array.isArray(accounts) && typeof accounts[0] === 'string' ? accounts[0] : ''
-      if (!user.walletAddress || activeAddress.toLowerCase() !== user.walletAddress.toLowerCase()) {
-        throw new ApiError('Reconnect the wallet used to authorize this session.', 401, 'WALLET_SESSION_MISMATCH')
-      }
+    void getCurrentUser().then((user) => {
       if (cancelled) return
-      setWalletAddress(user.walletAddress)
+      setWalletAddress(user.walletAddress ?? '')
       setWalletDisplayName(user.displayName)
       setIdentity(user.displayName)
+      setAccountUsername(user.username ?? '')
       setAccountId(user.id)
       const userRole: Record<string, Role> = { prosumer: 'Prosumer', consumer: 'Consumer', both: 'Both', verifier: 'Verifier', admin: 'Admin', funder: 'Funder', space_owner: 'Space owner' }
       setRole(userRole[user.role] ?? 'Consumer')
-      setAuthMode('wallet')
+      setAuthMode(user.authMethod)
       setAuthenticatedWorkspace(true)
     }).catch((error: unknown) => {
       if (cancelled) return
-      if (error instanceof ApiError && error.code === 'WALLET_SESSION_MISMATCH') {
-        void revokeWalletSession().catch(() => {
-          setApiError('The saved wallet did not match the active account, and the server session could not be revoked.')
-        })
-      }
       clearAccessToken()
-      setApiError(error instanceof Error ? error.message : 'The saved wallet session could not be resumed.')
+      setApiError(error instanceof Error ? error.message : 'The saved account session could not be resumed.')
     }).finally(() => {
       if (!cancelled) setApiBusy(false)
     })
@@ -398,11 +393,12 @@ function App() {
       setState(emptyState)
       setAccountId('')
       setIdentity('')
+      setAccountUsername('')
       setWalletAddress('')
       setAuthMode('none')
       setAuthenticatedWorkspace(false)
       setApiConnected(false)
-      setApiError('Your wallet session expired or was revoked. Connect and authorize your wallet to continue.')
+      setApiError('Your account session expired or was revoked. Sign in again to continue.')
       setPage('Overview')
     }
     window.addEventListener('bright-ledger:unauthorized', handleUnauthorized)
@@ -422,7 +418,7 @@ function App() {
   }, [authenticatedWorkspace])
 
   useEffect(() => {
-    const ethereum = window.ethereum
+    const ethereum = getActiveEvmWallet()
     if (!ethereum) return
     let active = true
     const updateChain = (value: unknown) => {
@@ -436,7 +432,6 @@ function App() {
     const onChainChanged = (value: unknown) => updateChain(value)
     const onAccountsChanged = (value: unknown) => {
       const nextAddress = Array.isArray(value) && typeof value[0] === 'string' ? value[0] : ''
-      setWalletAddress(nextAddress)
       if (authMode === 'wallet' && nextAddress.toLowerCase() !== walletAddress.toLowerCase()) {
         void revokeWalletSession().catch((error: unknown) => {
           setToast(error instanceof Error ? `Wallet changed; session revocation could not be confirmed: ${error.message}` : 'Wallet changed; server session revocation could not be confirmed.')
@@ -446,6 +441,8 @@ function App() {
         setAuthMode('none')
         setAccountId('')
         setIdentity('')
+        setAccountUsername('')
+        setWalletAddress('')
         setState(emptyState)
         setApiConnected(false)
         setWalletDisplayName(identity)
@@ -460,11 +457,6 @@ function App() {
     }).catch(() => {
       if (active) setWalletChainId(null)
     })
-    void ethereum.request({ method: 'eth_accounts' }).then((value) => {
-      if (active && Array.isArray(value) && typeof value[0] === 'string') setWalletAddress(value[0])
-    }).catch(() => {
-      if (active) setWalletAddress('')
-    })
     ethereum.on?.('chainChanged', onChainChanged)
     ethereum.on?.('accountsChanged', onAccountsChanged)
     return () => {
@@ -472,7 +464,7 @@ function App() {
       ethereum.removeListener?.('chainChanged', onChainChanged)
       ethereum.removeListener?.('accountsChanged', onAccountsChanged)
     }
-  }, [authMode, identity, walletAddress])
+  }, [authMode, identity, selectedWalletId, walletAddress])
 
   useEffect(() => {
     if (!toast) return
@@ -526,6 +518,7 @@ function App() {
     setAccountRemovalOpen(false)
     setAccountId('')
     setIdentity('')
+    setAccountUsername('')
     setWalletAddress('')
     setState(emptyState)
     setAuthMode('none')
@@ -552,6 +545,7 @@ function App() {
       setAccountId('')
       setWalletAddress('')
       setIdentity('')
+      setAccountUsername('')
       setAuthMode('none')
       setAuthenticatedWorkspace(false)
       setApiConnected(false)
@@ -578,12 +572,19 @@ function App() {
       notify('Enter a display name to create your wallet profile.')
       return
     }
+    const selectedWallet = walletProviders.find((wallet) => wallet.id === selectedWalletId)
+    if (!selectedWallet) {
+      setApiError('No compatible EVM wallet was found. Install or enable a browser wallet, then refresh the wallet list.')
+      return
+    }
     setApiBusy(true)
     setApiError('')
     setLandingNotice('')
     try {
-      const user = await signInWallet(name, walletRole)
+      selectEvmWallet(selectedWallet.id)
+      const user = await signInWallet(name, walletRole, selectedWallet.provider)
       setIdentity(user.displayName)
+      setAccountUsername(user.username ?? '')
       setAccountId(user.id)
       setWalletAddress(user.walletAddress ?? '')
       const userRole: Record<string, Role> = { prosumer: 'Prosumer', consumer: 'Consumer', both: 'Both', verifier: 'Verifier', admin: 'Admin', funder: 'Funder', space_owner: 'Space owner' }
@@ -597,6 +598,73 @@ function App() {
       setApiError(message)
       notify(message)
       setApiBusy(false)
+    }
+  }
+
+  async function connectPassword(input: {
+    mode: 'register' | 'login'
+    username: string
+    password: string
+    displayName?: string
+    role?: 'prosumer' | 'consumer' | 'both' | 'funder'
+  }) {
+    setApiBusy(true)
+    setApiError('')
+    setLandingNotice('')
+    try {
+      const user = await authenticatePassword(input)
+      setIdentity(user.displayName)
+      setAccountUsername(user.username)
+      setAccountId(user.id)
+      setWalletAddress(user.walletAddress ?? '')
+      const userRole: Record<string, Role> = { prosumer: 'Prosumer', consumer: 'Consumer', both: 'Both', verifier: 'Verifier', admin: 'Admin', funder: 'Funder', space_owner: 'Space owner' }
+      setRole(userRole[user.role] ?? 'Consumer')
+      setAuthMode('password')
+      setAuthenticatedWorkspace(true)
+      acceptDisclosure()
+      notify(input.mode === 'register' ? 'Account created. Link an EVM wallet in Settings before using wallet-dependent features.' : 'Signed in to your Bright Ledger account.')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Password authentication failed.'
+      setApiError(message)
+      notify(message)
+      setApiBusy(false)
+    }
+  }
+
+  async function linkWallet() {
+    const selectedWallet = walletProviders.find((wallet) => wallet.id === selectedWalletId)
+    if (!selectedWallet) {
+      setApiError('No compatible EVM wallet was found. Install or enable a browser wallet, then refresh the wallet list.')
+      return
+    }
+    setApiBusy(true)
+    setApiError('')
+    try {
+      selectEvmWallet(selectedWallet.id)
+      const user = await linkWalletWithSignature(selectedWallet.provider)
+      setWalletAddress(user.walletAddress)
+      setIdentity(user.displayName)
+      setAccountUsername(user.username ?? '')
+      setAccountId(user.id)
+      notify('EVM wallet linked after signature verification. Your private key remains in the wallet.')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not link this EVM wallet.'
+      setApiError(message)
+      notify(message)
+    } finally {
+      setApiBusy(false)
+    }
+  }
+
+  async function refreshWalletProviders() {
+    setApiError('')
+    try {
+      const wallets = await discoverEvmWallets()
+      setWalletProviders(wallets)
+      if (wallets[0]) setSelectedWalletId(wallets[0].id)
+      if (!wallets.length) setApiError('No EVM wallet was detected. Install or enable an EVM-compatible browser wallet, then retry.')
+    } catch (error) {
+      setApiError(error instanceof Error ? error.message : 'Could not refresh browser wallets.')
     }
   }
 
@@ -689,7 +757,7 @@ function App() {
   async function enterWorkspace() {
     acceptDisclosure()
     if (!hasAccessToken()) {
-      setApiError('Connect and authorize your EVM wallet before entering the private marketplace.')
+      setApiError('Sign in or create an account before entering the private marketplace.')
       document.querySelector('#account')?.scrollIntoView({ behavior: 'smooth' })
       return
     }
@@ -697,26 +765,17 @@ function App() {
     setApiError('')
     try {
       const user = await getCurrentUser()
-      const accounts = window.ethereum ? await window.ethereum.request({ method: 'eth_accounts' }) : []
-      const activeAddress = Array.isArray(accounts) && typeof accounts[0] === 'string' ? accounts[0] : ''
-      if (!user.walletAddress || activeAddress.toLowerCase() !== user.walletAddress.toLowerCase()) {
-        throw new ApiError('Connect and authorize the wallet linked to this account.', 401, 'WALLET_SESSION_MISMATCH')
-      }
       setIdentity(user.displayName)
+      setAccountUsername(user.username ?? '')
       setAccountId(user.id)
-      setWalletAddress(user.walletAddress)
+      setWalletAddress(user.walletAddress ?? '')
       const userRole: Record<string, Role> = { prosumer: 'Prosumer', consumer: 'Consumer', both: 'Both', verifier: 'Verifier', admin: 'Admin', funder: 'Funder', space_owner: 'Space owner' }
       setRole(userRole[user.role] ?? 'Consumer')
-      setAuthMode('wallet')
+      setAuthMode(user.authMethod)
       setAuthenticatedWorkspace(true)
     } catch (error) {
-      if (error instanceof ApiError && error.code === 'WALLET_SESSION_MISMATCH') {
-        void revokeWalletSession().catch(() => {
-          setApiError('The connected wallet did not match the saved account, and the server session could not be revoked.')
-        })
-      }
       clearAccessToken()
-      const message = error instanceof Error ? error.message : 'Wallet authorization is required.'
+      const message = error instanceof Error ? error.message : 'Account authentication is required.'
       setApiError(message)
       notify(message)
     } finally {
@@ -890,7 +949,11 @@ function App() {
     }
     setSelectedEvidence(null)
     setModal(null)
-    notify(decision === 'Approved' ? 'Evidence approved. The trade is ready to settle.' : 'Evidence rejected and the trade marked disputed.')
+    notify(decision === 'Approved'
+      ? 'Evidence approved. The trade is ready to settle.'
+      : chainPaymentsEnabled
+        ? 'Evidence rejected, the trade is disputed, and escrowed SepoliaETH was refunded to the buyer.'
+        : 'Evidence rejected and the trade marked disputed.')
   }
 
   async function submitEvidence(event: React.FormEvent<HTMLFormElement>, trade: Trade) {
@@ -1005,18 +1068,39 @@ function App() {
       const chainTransactionHash = chainEnabled ? await settleTradeOnChain(trade.id) : undefined
       await apiPost(`/api/trades/${encodeURIComponent(trade.id)}/settle`, chainTransactionHash ? { chainTransactionHash } : {})
       await refreshFromApi()
-      notify('Trade settled in shared records; points have no cash value.')
+      notify(chainPaymentsEnabled
+        ? 'Trade settled and escrowed SepoliaETH released to the seller. Reward points have no cash value.'
+        : 'Trade settled in shared records; points have no cash value.')
     } catch (error) {
       notify(error instanceof Error ? error.message : 'Could not settle this trade.')
     }
   }
 
   async function commitTrade(trade: Trade) {
+    if (chainPaymentsEnabled && trade.buyerWalletAddress?.toLowerCase() !== walletAddress.toLowerCase()) {
+      notify('Only the buyer wallet can approve and fund the escrow transaction.')
+      return
+    }
     try {
-      const transactionHash = await commitTradeOnChain(trade)
+      let quotedPaymentWei: bigint | undefined
+      if (chainPaymentsEnabled) {
+        const quote = await getTradePaymentQuote(trade)
+        quotedPaymentWei = quote.paymentWei
+        const totalUsd = trade.quantity * trade.price
+        const approved = window.confirm(
+          `Escrow this trade's USD ${totalUsd.toFixed(4)} equivalent?\n\n` +
+          `Payment: ${quote.paymentEth} SepoliaETH\n` +
+          `ETH/USD quote: $${quote.ethUsdPrice.toFixed(2)}\n\n` +
+          'MetaMask will ask you to approve the transaction. The ETH is held by the contract until evidence is approved, or refunded if it is rejected. This is testnet ETH with no real-world value.',
+        )
+        if (!approved) return
+      }
+      const transactionHash = await commitTradeOnChain(trade, quotedPaymentWei)
       await apiPost(`/api/trades/${encodeURIComponent(trade.id)}/commitment`, { transactionHash })
       await refreshFromApi()
-      notify('Trade terms were committed to the configured EVM contract.')
+      notify(chainPaymentsEnabled
+        ? 'Trade terms were recorded and SepoliaETH escrowed by the contract.'
+        : 'Trade terms were committed to the configured EVM contract.')
     } catch (error) {
       notify(error instanceof Error ? error.message : 'Could not commit this trade on-chain.')
     }
@@ -1073,10 +1157,22 @@ function App() {
     <Landing
       onExplore={() => { void enterWorkspace() }}
       onWallet={() => { void connectWallet() }}
+      onPasswordAuth={(input) => { void connectPassword(input) }}
       displayName={walletDisplayName}
       setDisplayName={setWalletDisplayName}
       walletRole={walletRole}
       setWalletRole={setWalletRole}
+      walletProviders={walletProviders}
+      selectedWalletId={selectedWalletId}
+      setSelectedWalletId={(id) => {
+        try {
+          selectEvmWallet(id)
+          setSelectedWalletId(id)
+        } catch (error) {
+          setApiError(error instanceof Error ? error.message : 'Could not select this wallet.')
+        }
+      }}
+      onRefreshWallets={() => { void refreshWalletProviders() }}
       theme={theme}
       busy={apiBusy}
       error={apiError}
@@ -1105,7 +1201,7 @@ function App() {
         <div className="sidebar-bottom">
           <div className="network-card"><div className="network-icon"><Bolt size={17} /></div><div><span>{walletChainId === null ? 'Wallet network' : evmNetworkName(walletChainId)}</span><small>{walletChainId === null ? 'Connect an EVM wallet' : `Chain ID ${walletChainId}${configuredChainId === walletChainId ? ' · contract configured' : ' · no contract configured'}`}</small></div><span className={`network-live ${walletChainId !== null && configuredChainId === walletChainId ? '' : 'offline'}`} /></div>
           <button className="profile-card" onClick={() => { setPage('Settings'); setMenuOpen(false) }}>
-            <span className="avatar">{identity.split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase() || 'BL'}</span><span><b>{identity || 'Bright Ledger'}</b><small>{role} · Wallet account</small></span><MoreHorizontal size={18} />
+            <span className="avatar">{identity.split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase() || 'BL'}</span><span><b>{identity || 'Bright Ledger'}</b><small>{role} · {authMode === 'wallet' ? 'Wallet account' : 'Password account'}</small></span><MoreHorizontal size={18} />
           </button>
         </div>
       </aside>
@@ -1138,17 +1234,21 @@ function App() {
             </div>
             <div className="wallet-menu-wrap">
               <button className="wallet-button" aria-expanded={accountMenuOpen} onClick={() => { setAccountMenuOpen((open) => !open); setNotificationsOpen(false) }}>
-                <Wallet size={16} /><span>{`${walletAddress.slice(0, 6)}…${walletAddress.slice(-4)}`}</span><ChevronDown size={14} />
+                <Wallet size={16} /><span>{walletAddress ? `${walletAddress.slice(0, 6)}…${walletAddress.slice(-4)}` : identity}</span><ChevronDown size={14} />
               </button>
               {accountMenuOpen && <div className="account-popover">
                 {authMode === 'wallet' ? <>
-                  <div className="account-popover-heading"><span className="avatar">{identity.split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase() || 'W3'}</span><span><b>{identity}</b><small>{role} · wallet profile</small></span></div>
+                  <div className="account-popover-heading"><span className="avatar">{identity.split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase() || 'W3'}</span><span><b>{identity}</b><small>{accountUsername ? `@${accountUsername} · ` : ''}{role} · wallet profile</small></span></div>
                   <div className="account-address"><span>Connected address</span><code title={walletAddress}>{walletAddress}</code><button className="text-link" onClick={() => { void copyText(walletAddress) }}><Copy size={13} /> Copy address</button></div>
                   <div className="account-network"><span>{walletChainId === null ? 'Network unavailable' : evmNetworkName(walletChainId)}</span><small>{walletChainId === null ? 'Check your wallet connection' : `Chain ID ${walletChainId}${configuredChainId === walletChainId ? ' · contract ready' : ' · contract unavailable'}`}</small></div>
                   {explorerAddressUrl(walletChainId, walletAddress) && <a className="account-menu-link" href={explorerAddressUrl(walletChainId, walletAddress)!} target="_blank" rel="noreferrer"><ExternalLink size={14} /> View address on explorer</a>}
                   <button className="account-menu-link" onClick={() => { setPage('Settings'); setAccountMenuOpen(false) }}><Settings size={14} /> Profile & wallet settings</button>
                   <button className="account-menu-link" onClick={signOut}><Wallet size={14} /> Sign out of Bright Ledger</button>
                   <button className="account-menu-link danger-link" onClick={() => { setAccountRemovalOpen(true); setAccountMenuOpen(false) }}><X size={14} /> Remove account profile</button>
+                </> : authMode === 'password' ? <>
+                  <div className="account-popover-heading"><span className="avatar">{identity.split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase() || 'BL'}</span><span><b>{identity}</b><small>@{accountUsername} · {role} · password account</small></span></div>
+                  <button className="account-menu-link" onClick={() => { setPage('Settings'); setAccountMenuOpen(false) }}><Settings size={14} /> Account & wallet settings</button>
+                  <button className="account-menu-link" onClick={signOut}><Wallet size={14} /> Sign out of Bright Ledger</button>
                 </> : null}
               </div>}
             </div>
@@ -1157,6 +1257,7 @@ function App() {
 
         <div className="content-area">
           {!apiConnected && <div className="storage-warning"><CircleHelp size={15} /> {apiBusy ? 'Connecting to the Bright Ledger API…' : apiError || 'Backend connection unavailable. Shared activity requires the API connection.'}</div>}
+          {!walletAddress && <div className="helper-note"><CircleHelp size={15} /><span>This account has no verified EVM wallet. Listings, trades, and wallet-signed blockchain actions are unavailable until you link one.</span><button className="text-link" onClick={() => setPage('Settings')}>Link in Settings <ArrowRight size={13} /></button></div>}
           <div className="page-heading">
             <div><div className="eyebrow"><span className="eyebrow-line" /> YOUR ENERGY, YOUR COMMUNITY</div><h1>{pageTitle}<span className="greeting-sun">✳</span></h1><p>{pageDescription[page]}</p></div>
             <div className="heading-actions">
@@ -1178,7 +1279,14 @@ function App() {
           {page === 'Solar projects' && ['Verifier', 'Admin'].includes(role) && <SolarProjectReviewQueue projects={state.projects.filter((project) => project.status === 'Review')} onReview={(project, decision) => { void reviewSolarProject(project, decision) }} />}
           {page === 'Solar projects' && <SolarEstimateTransparency projects={filteredProjects} />}
           {page === 'Activity' && <ActivityPage activity={state.activity} onCopy={copyText} />}
-          {page === 'Settings' && <SettingsPage role={role} walletConnected={authMode === 'wallet'} walletAddress={walletAddress} walletChainId={walletChainId} configuredChainId={configuredChainId} contractAddress={contractAddress} theme={theme} setTheme={setTheme} onCopy={(value) => { void copyText(value) }} onSignOut={signOut} onRequestRemove={() => setAccountRemovalOpen(true)} onStartTour={startTour} onReset={() => { void refreshFromApi().then(() => notify('Refreshed shared records from the server.')).catch((error: unknown) => notify(error instanceof Error ? error.message : 'Could not refresh server records.')) }} />}
+          {page === 'Settings' && <SettingsPage role={role} username={accountUsername} authMode={authMode === 'wallet' ? 'wallet' : 'password'} walletConnected={Boolean(walletAddress)} walletAddress={walletAddress} walletChainId={walletChainId} configuredChainId={configuredChainId} contractAddress={contractAddress} walletProviders={walletProviders} selectedWalletId={selectedWalletId} apiBusy={apiBusy} setSelectedWalletId={(id) => {
+            try {
+              selectEvmWallet(id)
+              setSelectedWalletId(id)
+            } catch (error) {
+              setApiError(error instanceof Error ? error.message : 'Could not select this wallet.')
+            }
+          }} onRefreshWallets={refreshWalletProviders} onLinkWallet={() => { void linkWallet() }} theme={theme} setTheme={setTheme} onCopy={(value) => { void copyText(value) }} onSignOut={signOut} onRequestRemove={() => setAccountRemovalOpen(true)} onStartTour={startTour} onReset={() => { void refreshFromApi().then(() => notify('Refreshed shared records from the server.')).catch((error: unknown) => notify(error instanceof Error ? error.message : 'Could not refresh server records.')) }} />}
         </div>
         <footer className="page-footer"><span>© 2026 Bright Ledger</span><span><span className="footer-dot" /> Shared records</span><button onClick={() => notify('Energy delivery, payments, and environmental claims are not verified by this software.')}>Platform limitations <ExternalLink size={13} /></button></footer>
       </main>
@@ -1272,13 +1380,18 @@ function Overview({ state, setPage, onCreate, openOffers, offered, settled, poin
   </div>
 }
 
-function Landing({ onExplore, onWallet, displayName, setDisplayName, walletRole, setWalletRole, theme, busy, error, notice }: {
+function Landing({ onExplore, onWallet, onPasswordAuth, displayName, setDisplayName, walletRole, setWalletRole, walletProviders, selectedWalletId, setSelectedWalletId, onRefreshWallets, theme, busy, error, notice }: {
   onExplore: () => void
   onWallet: () => void
+  onPasswordAuth: (input: { mode: 'register' | 'login'; username: string; password: string; displayName?: string; role?: 'prosumer' | 'consumer' | 'both' | 'funder' }) => void
   displayName: string
   setDisplayName: (value: string) => void
   walletRole: 'prosumer' | 'consumer' | 'both' | 'funder'
   setWalletRole: (value: 'prosumer' | 'consumer' | 'both' | 'funder') => void
+  walletProviders: EvmWalletInfo[]
+  selectedWalletId: string
+  setSelectedWalletId: (id: string) => void
+  onRefreshWallets: () => void
   theme: 'light' | 'dark'
   busy: boolean
   error: string
@@ -1287,6 +1400,10 @@ function Landing({ onExplore, onWallet, displayName, setDisplayName, walletRole,
   const modelFrame = useRef<HTMLIFrameElement>(null)
   const [modelLoaded, setModelLoaded] = useState(false)
   const [modelFailed, setModelFailed] = useState(false)
+  const [authTab, setAuthTab] = useState<'password' | 'wallet'>('password')
+  const [passwordMode, setPasswordMode] = useState<'register' | 'login'>('register')
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
   useEffect(() => {
     modelFrame.current?.contentWindow?.postMessage({ type: 'bl-theme', theme }, '*')
   }, [theme])
@@ -1357,14 +1474,50 @@ function Landing({ onExplore, onWallet, displayName, setDisplayName, walletRole,
       <p className="impact-boundary"><ShieldCheck size={15} /> Bright Ledger currently records marketplace activity; this software does not deliver electricity, clear trades with a utility, verify meter data independently, or calculate avoided emissions. Any climate impact must be measured outside the platform and reported with its method and limitations.</p>
       <button className="button button-secondary" onClick={onExplore}>Explore the marketplace <ArrowRight size={15} /></button>
     </section>
-    <section className="landing-account" id="account"><div><span className="section-kicker">JOIN YOUR LOCAL NETWORK</span><h2>Start with your wallet.<br /><em>Stay in control.</em></h2><p>Sign a one-time account challenge with an EVM wallet. Your private keys stay in your wallet, and you can participate as a consumer, prosumer, or funder. Energy-host access is operator-approved.</p>{error && <div className="landing-error" role="alert">{error}</div>}{notice && <div className="landing-notice" role="status">{notice}</div>}</div><form className="wallet-signup" onSubmit={(event) => { event.preventDefault(); onWallet() }}><label>Display name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="Your name" minLength={2} maxLength={80} required /></label><label>Participation role<select value={walletRole} onChange={(event) => setWalletRole(event.target.value as 'prosumer' | 'consumer' | 'both' | 'funder')}><option value="consumer">Consumer · looking for clean energy</option><option value="prosumer">Prosumer · sharing generated energy</option><option value="both">Both · consume and share</option><option value="funder">Funder · follow community projects</option></select></label><button className="button button-primary" disabled={busy} type="submit"><Wallet size={16} /> {busy ? 'Connecting…' : 'Create account with wallet'} <ArrowRight size={15} /></button><small>Bright Ledger will only request a signature. It never asks for your seed phrase or private key.</small><small>Network follows your wallet selection; on-chain actions need a deployed contract on that network. XRP Ledger requires separate integration.</small></form></section>
+    <section className="landing-account" id="account"><div><span className="section-kicker">JOIN YOUR LOCAL NETWORK</span><h2>Choose how to sign in.<br /><em>Stay in control.</em></h2><p>Create an account with a username and password, then link an EVM wallet later in Settings. Or sign in directly with a browser wallet. Wallet-dependent marketplace and on-chain actions require a verified linked wallet.</p>{error && <div className="landing-error" role="alert">{error}</div>}{notice && <div className="landing-notice" role="status">{notice}</div>}</div><div className="wallet-signup">
+      <div className="segmented-tabs" role="tablist" aria-label="Account sign-in method">
+        <button type="button" role="tab" aria-selected={authTab === 'password'} className={authTab === 'password' ? 'selected' : ''} onClick={() => setAuthTab('password')}>Username & password</button>
+        <button type="button" role="tab" aria-selected={authTab === 'wallet'} className={authTab === 'wallet' ? 'selected' : ''} onClick={() => setAuthTab('wallet')}>Browser wallet</button>
+      </div>
+      {authTab === 'password' ? <form onSubmit={(event) => {
+        event.preventDefault()
+        onPasswordAuth({
+          mode: passwordMode,
+          username,
+          password,
+          ...(passwordMode === 'register' ? { displayName: displayName.trim(), role: walletRole } : {}),
+        })
+      }}>
+        <div className="segmented-tabs" role="tablist" aria-label="Password account action">
+          <button type="button" role="tab" aria-selected={passwordMode === 'register'} className={passwordMode === 'register' ? 'selected' : ''} onClick={() => setPasswordMode('register')}>Create account</button>
+          <button type="button" role="tab" aria-selected={passwordMode === 'login'} className={passwordMode === 'login' ? 'selected' : ''} onClick={() => setPasswordMode('login')}>Sign in</button>
+        </div>
+        {passwordMode === 'register' && <label>Display name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="Your name" minLength={2} maxLength={80} required /></label>}
+        <label>Username<input autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} placeholder="3–30 letters, numbers, or underscores" minLength={3} maxLength={30} pattern="[A-Za-z0-9_]+" required /></label>
+        <label>Password<input autoComplete={passwordMode === 'register' ? 'new-password' : 'current-password'} type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder={passwordMode === 'register' ? 'At least 12 characters' : 'Your password'} minLength={passwordMode === 'register' ? 12 : 1} maxLength={128} required /></label>
+        {passwordMode === 'register' && <label>Participation role<select value={walletRole} onChange={(event) => setWalletRole(event.target.value as 'prosumer' | 'consumer' | 'both' | 'funder')}><option value="consumer">Consumer · looking for clean energy</option><option value="prosumer">Prosumer · sharing generated energy</option><option value="both">Both · consume and share</option><option value="funder">Funder · follow community projects</option></select></label>}
+        <button className="button button-primary" disabled={busy} type="submit"><CheckCircle2 size={16} /> {busy ? 'Please wait…' : passwordMode === 'register' ? 'Create account' : 'Sign in'} <ArrowRight size={15} /></button>
+        <small>Use a unique password. Passwords are stored as salted hashes. Password reset is not available because no recovery channel is configured.</small>
+        {passwordMode === 'register' && <small>You can link a browser EVM wallet later in Settings. Until then, wallet-required marketplace and blockchain actions are unavailable.</small>}
+      </form> : <form onSubmit={(event) => { event.preventDefault(); onWallet() }}>
+        <label>Display name<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="Your name" minLength={2} maxLength={80} required /></label>
+        <label>Participation role<select value={walletRole} onChange={(event) => setWalletRole(event.target.value as 'prosumer' | 'consumer' | 'both' | 'funder')}><option value="consumer">Consumer · looking for clean energy</option><option value="prosumer">Prosumer · sharing generated energy</option><option value="both">Both · consume and share</option><option value="funder">Funder · follow community projects</option></select></label>
+        <label>Browser EVM wallet<select value={selectedWalletId} onChange={(event) => setSelectedWalletId(event.target.value)} required>
+          {walletProviders.length === 0 && <option value="">No wallet detected</option>}
+          {walletProviders.map((wallet) => <option key={wallet.id} value={wallet.id}>{wallet.name}</option>)}
+        </select></label>
+        <button className="button button-outline" type="button" onClick={onRefreshWallets}>Refresh wallet list</button>
+        <button className="button button-primary" disabled={busy || walletProviders.length === 0} type="submit"><Wallet size={16} /> {busy ? 'Connecting…' : 'Create account with wallet'} <ArrowRight size={15} /></button>
+        <small>Bright Ledger only requests a signature; it never asks for your seed phrase or private key. Compatible injected EVM wallets include Trust Wallet and Phantom’s EVM mode. Solana-only Phantom requires separate support.</small>
+      </form>}
+    </div></section>
     <footer className="landing-footer"><Logo compact /><span>Clean energy. Real value.</span><span>Energy delivery, payments, and environmental claims require independent verification.</span><button onClick={onExplore}>Enter marketplace <ArrowRight size={14} /></button></footer>
   </main>
 }
 
 function Disclosure({ onAccept }: { onAccept: () => void }) {
   const [confirmed, setConfirmed] = useState(false)
-  return <div className="disclosure-backdrop"><section className="disclosure-card" role="dialog" aria-modal="true" aria-labelledby="disclosure-title" aria-describedby="disclosure-copy"><span className="disclosure-icon"><ShieldCheck size={22} /></span><span className="section-kicker">PROTOTYPE · NOT FOR REAL TRANSACTIONS</span><h2 id="disclosure-title">Please use sample data only</h2><p id="disclosure-copy">Bright Ledger is a prototype, not a live energy or financial service. It records listings, trade and evidence reports, and non-cash solar pledges; it does not deliver electricity, accept investments, transfer money, or pay returns. Solar estimates and AI reviews are advisory, not verified engineering or financial advice. Use fictional names and site details, do not upload genuine or sensitive documents, and never connect a wallet holding assets or send funds. Records are stored in PostgreSQL and may not meet production security or privacy requirements. Seek qualified review before real-world use.</p><label className="disclosure-consent"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>I understand and will use fictional/sample data only.</span></label><button className="button button-primary" onClick={onAccept} disabled={!confirmed}>Continue to prototype <ArrowRight size={15} /></button></section></div>
+  return <div className="disclosure-backdrop"><section className="disclosure-card" role="dialog" aria-modal="true" aria-labelledby="disclosure-title" aria-describedby="disclosure-copy"><span className="disclosure-icon"><ShieldCheck size={22} /></span><span className="section-kicker">PROTOTYPE · TESTNET ONLY</span><h2 id="disclosure-title">Please use sample data only</h2><p id="disclosure-copy">Bright Ledger is a prototype, not a live energy or financial service. It does not deliver electricity, accept investments, transfer real-world money, or pay returns. If a Sepolia contract is configured, trade escrow can transfer testnet SepoliaETH with no real-world value and still requires wallet approval and network fees. Never connect a wallet holding valuable assets or use mainnet. Solar estimates and AI reviews are advisory, not verified engineering or financial advice. Use fictional names and site details, do not upload genuine or sensitive documents, and do not submit sensitive credentials. Records are stored in PostgreSQL and may not meet production security or privacy requirements. Seek qualified review before real-world use.</p><label className="disclosure-consent"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>I understand and will use fictional/sample data and testnet wallets only.</span></label><button className="button button-primary" onClick={onAccept} disabled={!confirmed}>Continue to prototype <ArrowRight size={15} /></button></section></div>
 }
 
 function Status({ status }: { status: string }) {
@@ -1611,13 +1764,21 @@ function ActivityPage({ activity, onCopy }: { activity: AppState['activity']; on
   return <div className="page-stack"><section className="panel list-page-panel"><div className="panel-heading"><div><span className="section-kicker">TRANSPARENT BY DEFAULT</span><h2>Activity & audit trail</h2><p>Application events are shown separately from any simulated chain references.</p></div><button className="button button-outline" onClick={() => onCopy(JSON.stringify(activity, null, 2))}><Download size={15} /> Copy report</button></div><div className="timeline-list">{activity.map((event, index) => <div className="timeline-item" key={`${event.title}-${index}`}><span className={`timeline-node ${index === 0 ? 'latest' : ''}`}><Activity size={14} /></span><div><b>{event.title}</b><p>{event.detail}</p><small>{event.time} · Wallet account event</small></div><button className="icon-button tiny" aria-label="Copy event" onClick={() => onCopy(`${event.title} — ${event.detail}`)}><Copy size={14} /></button></div>)}{activity.length === 0 && <div className="empty-state"><ClipboardCheck size={25} /><h3>No activity yet</h3><p>Actions you take will appear here.</p></div>}</div><div className="audit-legend"><span><i className="legend-dot app-event" /> Application event</span><span><i className="legend-dot chain-event" /> Chain data: not connected</span></div></section></div>
 }
 
-function SettingsPage({ role, walletConnected, walletAddress, walletChainId, configuredChainId, contractAddress, theme, setTheme, onCopy, onSignOut, onRequestRemove, onStartTour, onReset }: {
+function SettingsPage({ role, username, authMode, walletConnected, walletAddress, walletChainId, configuredChainId, contractAddress, walletProviders, selectedWalletId, apiBusy, setSelectedWalletId, onRefreshWallets, onLinkWallet, theme, setTheme, onCopy, onSignOut, onRequestRemove, onStartTour, onReset }: {
   role: Role
+  username: string
+  authMode: 'password' | 'wallet'
   walletConnected: boolean
   walletAddress: string
   walletChainId: number | null
   configuredChainId: number | null
   contractAddress: string | null
+  walletProviders: EvmWalletInfo[]
+  selectedWalletId: string
+  apiBusy: boolean
+  setSelectedWalletId: (id: string) => void
+  onRefreshWallets: () => void
+  onLinkWallet: () => void
   theme: 'light' | 'dark'
   setTheme: (value: 'light' | 'dark') => void
   onCopy: (value: string) => void
@@ -1633,10 +1794,24 @@ function SettingsPage({ role, walletConnected, walletAddress, walletChainId, con
         <div>
           <span className="section-kicker">ACCOUNT</span>
           <h2>Profile & role</h2>
-          <p>Your role is bound to this wallet profile. Verifier and administrator access is assigned only by an operator allowlist.</p>
+          <p>{authMode === 'password' ? 'Your account uses username and password authentication. Link an EVM wallet to unlock wallet-dependent marketplace and blockchain actions.' : 'Your account is authenticated by your EVM wallet. Verifier and administrator access is assigned only by an operator allowlist.'}</p>
           <div className="settings-field">Wallet role <b>{role}</b></div>
-          <div className="settings-note"><CircleHelp size={15} /> {walletConnected ? 'An EVM wallet is connected. Bright Ledger never receives its private key.' : 'No wallet is connected. Wallet sign-in requests a signature, never a private key.'}</div>
+          {username && <div className="settings-field">Username <b>@{username}</b></div>}
+          <div className="settings-note"><CircleHelp size={15} /> {walletConnected ? 'An EVM wallet is linked after signature verification. Bright Ledger never receives its private key.' : 'No wallet is linked. Wallet-dependent listings, trades, and blockchain actions remain unavailable until you link one.'}</div>
+          {!walletConnected && <div className="web3-profile">
+            <label>Browser EVM wallet<select value={selectedWalletId} onChange={(event) => setSelectedWalletId(event.target.value)} disabled={walletProviders.length === 0}>
+              {walletProviders.length === 0 && <option value="">No wallet detected</option>}
+              {walletProviders.map((wallet) => <option key={wallet.id} value={wallet.id}>{wallet.name}</option>)}
+            </select></label>
+            <div className="web3-profile-actions"><button className="button button-outline" type="button" onClick={onRefreshWallets}>Refresh wallet list</button><button className="button button-primary" type="button" disabled={apiBusy || walletProviders.length === 0} onClick={onLinkWallet}>{apiBusy ? 'Waiting for wallet…' : 'Link wallet by signature'}</button></div>
+            <small>Supports browser-injected EVM wallets. Phantom’s EVM mode may work; Solana-only Phantom and mobile deep links are not supported.</small>
+          </div>}
           {walletConnected && <div className="web3-profile">
+            <label>Active browser wallet<select value={selectedWalletId} onChange={(event) => setSelectedWalletId(event.target.value)} disabled={walletProviders.length === 0}>
+              {walletProviders.length === 0 && <option value="">No wallet detected</option>}
+              {walletProviders.map((wallet) => <option key={wallet.id} value={wallet.id}>{wallet.name}</option>)}
+            </select></label>
+            <button className="button button-outline" type="button" onClick={onRefreshWallets}>Refresh wallet list</button>
             <div><span>Wallet address</span><code>{walletAddress}</code><button className="text-link" onClick={() => onCopy(walletAddress)}><Copy size={13} /> Copy address</button></div>
             <div><span>Active network</span><b>{walletChainId === null ? 'Unavailable' : `${evmNetworkName(walletChainId)} · ${walletChainId}`}</b></div>
             <div><span>On-chain actions</span><b>{walletChainId !== null && walletChainId === configuredChainId ? 'Contract configured for this network' : 'No matching deployed contract'}</b></div>

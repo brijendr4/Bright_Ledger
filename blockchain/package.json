@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "node": "hardhat node",
+    "build": "hardhat compile",
     "compile": "hardhat compile",
     "test": "hardhat test",
     "deploy": "hardhat run scripts/deploy.ts --network localhost",
-    "deploy:base-sepolia": "hardhat run scripts/deploy.ts --network baseSepolia"
+    "deploy:base-sepolia": "hardhat run scripts/deploy.ts --network baseSepolia",
+    "deploy:sepolia": "hardhat run scripts/deploy.ts --network sepolia"
   },
   "devDependencies": {
     "@nomicfoundation/hardhat-ethers": "^4.2.1",

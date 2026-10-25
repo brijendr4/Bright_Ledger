@@ -12,14 +12,14 @@ Bright Ledger is structured as a monorepo with three main runtime areas:
 
 - Frontend: Vite + React + TypeScript in `frontend/`
 - Backend: Express + PostgreSQL + wallet-auth + API logic in `backend/`
-- Blockchain: Hardhat/Ethers local contract environment in `blockchain/`
+- Blockchain: Hardhat/Ethers contract workspace in `blockchain/`; contracts deploy to a selected EVM network rather than run as a hosted application service
 
 The project is designed for:
 
 - Local development via Docker Compose
 - Separate deployment of the API and static frontend to SmarterASP.NET, subject to selected-plan compatibility
 - Local blockchain development using Hardhat and a local EVM
-- Production-like staging configuration using distinct environment variables and host-managed secrets
+- Ethereum Sepolia contract deployment with native test-ETH escrow for trade lifecycle testing
 
 ## 3. Current deployment architecture in this repo
 
@@ -65,12 +65,14 @@ Deploy the generated static files using the SmarterASP.NET static-site or web-fi
 ### 3.4 Blockchain deploy target
 The blockchain package uses Hardhat:
 
+- `build`: `hardhat compile`
 - `node`: `hardhat node`
 - `compile`: `hardhat compile`
 - `test`: `hardhat test`
 - `deploy`: `hardhat run scripts/deploy.ts --network localhost`
+- `deploy:sepolia`: `hardhat run scripts/deploy.ts --network sepolia`
 
-The project is designed for local EVM work first and can be extended to a testnet deployment later.
+The contract is a one-time deployment artifact, not a long-running process. Deploy it from a trusted local machine or CI runner; the SmarterASP.NET backend talks to the deployed contract over the configured RPC endpoint. Do not run Hardhat node on the hosting service.
 
 ## 4. Environment and configuration requirements
 
@@ -88,6 +90,8 @@ The repo contains `.env.example` with the following expected variables:
 - `CHAIN_RPC_URL=http://127.0.0.1:8545`
 - `CONTRACT_ADDRESS=`
 - `CHAIN_ID=31337`
+- `SEPOLIA_RPC_URL=https://ethereum-sepolia-rpc.publicnode.com`
+- `DEPLOYER_PRIVATE_KEY` (local deployment only; never configure on the frontend or hosted backend)
 - `EIA_API_KEY=`
 - `OPENROUTER_API_KEY=`
 - `OPENROUTER_MODEL=nvidia/nemotron-3.5-super-vl:free`
@@ -161,16 +165,19 @@ Intended target architecture, subject to plan compatibility:
 - Frontend: static Vite output on SmarterASP.NET
 - Backend: Node.js API on SmarterASP.NET
 - Database: PostgreSQL service reachable by the backend
-- Smart contracts: testnet or local staging chain as appropriate
+- Smart contract: one-time deployment to Ethereum Sepolia; the backend uses Sepolia RPC
 
 Deployment steps:
 
 1. Confirm the selected SmarterASP.NET plan supports the Node.js runtime, long-running API process, PostgreSQL connectivity, and static frontend hosting required by this app; verify current free-offer limits with the provider.
-2. Build the frontend with `npm run build:frontend` after setting `VITE_API_BASE_URL`, then publish the contents of `frontend/dist`.
-3. Build the backend from `backend/` with `npm ci && npm run build`, configure its server-side environment variables, and start it with `npm start`.
-4. Configure the PostgreSQL database connection and run the API so its startup migrations can apply.
-5. Ensure CORS allows the deployed frontend origin only.
-6. Verify `/api/health` and the frontend page on their HTTPS domains.
+2. From the repository root, run `npm run build` and `npm run chain:test` to build the frontend, backend, and Solidity contract and run its tests.
+3. From a trusted local machine or CI runner, deploy once with `npm run chain:deploy:sepolia`; the deployer wallet needs SepoliaETH for deployment gas. Keep its private key local and save the printed contract address.
+4. Build the frontend with `VITE_API_BASE_URL` set to the deployed API's HTTPS origin, then publish the contents of `frontend/dist`.
+5. Build the backend from `backend/` with `npm ci && npm run build`, configure server-side environment variables, and start it with `npm start`. Include `CHAIN_RPC_URL=https://ethereum-sepolia-rpc.publicnode.com`, `CHAIN_ID=11155111`, and the deployed `CONTRACT_ADDRESS`. Do not configure `DEPLOYER_PRIVATE_KEY` on the host.
+6. Add the authorized verifier wallet to `VERIFIER_WALLET_ADDRESSES`; the contract owner/deployer must also enable that wallet with `setVerifier` (the deployer is a verifier by default).
+7. Configure the PostgreSQL database connection and run the API so its startup migrations can apply.
+8. Ensure CORS allows the deployed frontend origin only.
+9. Verify `/api/health`, `/api/config`, the frontend page, and a buyer-authorized Sepolia escrow/review/refund-or-release flow using test wallets.
 
 ### Phase 3: Preview and release deployment
 
