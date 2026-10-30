@@ -14,6 +14,7 @@ import { findCompatibleMatch } from './market-policy.js';
 import { getMarketBenchmark } from './market-benchmark.js';
 import { inspectEvidenceFile, reviewEvidenceFile } from './evidence-ai.js';
 import { calculateSolarFunding, reviewSolarFundingPlan, solarFundingInputSchema } from './solar-funding-ai.js';
+import { calculateSimulatedIncomeAllocations } from './project-income.js';
 const api = express();
 function routeId(request) {
     const id = request.params.id;
@@ -55,6 +56,7 @@ const rpcUrl = process.env.CHAIN_RPC_URL?.trim() || (chainId === 84532 && proces
     ? `https://base-sepolia.g.alchemy.com/v2/${process.env.BASE_SEPOLIA_ALCHEMY_API_KEY}`
     : undefined);
 const contractAddress = process.env.CONTRACT_ADDRESS ?? '';
+const boaContractAddress = process.env.BOA_CONTRACT_ADDRESS ?? '';
 const provider = rpcUrl ? new JsonRpcProvider(rpcUrl) : null;
 const tradingInterface = new Interface([
     'event TradeCommitted(bytes32 indexed tradeId,address indexed buyer,address indexed seller,uint64 energyWh,uint128 pricePerKWhScaled,uint256 paymentWei)',
@@ -64,6 +66,35 @@ const tradingInterface = new Interface([
     'event TradePaymentReleased(bytes32 indexed tradeId,address indexed seller,uint256 amountWei)',
     'event TradePaymentRefunded(bytes32 indexed tradeId,address indexed buyer,uint256 amountWei)',
 ]);
+const boaInterface = new Interface([
+    'event BondPosted(bytes32 indexed projectId,address indexed operator,uint256 amount,uint64 unlockAt)',
+    'event MilestoneSubmitted(bytes32 indexed projectId,bytes32 indexed milestoneId,bytes32 evidenceHash)',
+    'event MilestoneReviewed(bytes32 indexed projectId,bytes32 indexed milestoneId,bool approved,bytes32 reasonHash)',
+]);
+function findTradeEvent(receipt, name, tradeId) {
+    return receipt?.logs
+        .filter((log) => log.address.toLowerCase() === contractAddress.toLowerCase())
+        .map((log) => { try {
+        return tradingInterface.parseLog(log);
+    }
+    catch {
+        return null;
+    } })
+        .find((event) => event?.name === name && event.args.tradeId === tradeId);
+}
+function findBoaEvent(receipt, name, projectId, milestoneId) {
+    return receipt?.logs
+        .filter((log) => log.address.toLowerCase() === boaContractAddress.toLowerCase())
+        .map((log) => { try {
+        return boaInterface.parseLog(log);
+    }
+    catch {
+        return null;
+    } })
+        .find((event) => event?.name === name &&
+        event.args.projectId === keccak256(toUtf8Bytes(projectId)) &&
+        (milestoneId === undefined || event.args.milestoneId === keccak256(toUtf8Bytes(milestoneId))));
+}
 api.get('/api/health', asyncRoute(async (_request, response) => {
     await query('SELECT 1');
     let chainConnected = false;
@@ -103,6 +134,15 @@ api.use('/api', requireAuth);
 api.get('/api/me', (request, response) => {
     response.json({ id: request.user.id, username: request.user.username, displayName: request.user.displayName, role: request.user.role, walletAddress: request.user.walletAddress, authMethod: request.user.authMethod ?? 'wallet' });
 });
+api.patch('/api/me/role', asyncRoute(async (request, response) => {
+    const { role } = z.object({ role: z.enum(['prosumer', 'consumer', 'both', 'funder']) }).parse(request.body);
+    if (!['prosumer', 'consumer', 'both', 'funder'].includes(request.user.role)) {
+        throw new HttpError(403, 'Verifier, administrator, and energy-host roles are managed by the platform operator.', 'ROLE_CHANGE_NOT_ALLOWED');
+    }
+    await query('UPDATE users SET role=$2 WHERE id=$1', [request.user.id, role]);
+    request.user.role = role;
+    response.json({ role });
+}));
 api.delete('/api/auth/session', revokeCurrentSession);
 api.post('/api/auth/account-removal-challenge', createAccountRemovalChallenge);
 api.post('/api/auth/wallet-link/nonce', createWalletLinkNonce);
@@ -115,6 +155,8 @@ api.get('/api/config', (_request, response) => {
             enabled: Boolean(provider && contractAddress),
             paymentsEnabled: chainId === 11155111 && Boolean(provider && contractAddress),
             contractAddress: contractAddress || null,
+            boaEnabled: Boolean(provider && boaContractAddress),
+            boaContractAddress: boaContractAddress || null,
         },
     });
 });
@@ -131,7 +173,9 @@ api.get('/api/bootstrap', asyncRoute(async (request, response) => {
         query(`SELECT t.public_id AS id,b.display_name AS buyer,s.display_name AS seller,
         b.wallet_address AS "buyerWalletAddress",s.wallet_address AS "sellerWalletAddress",t.quantity_kwh AS quantity,
         t.price_per_kwh AS price,t.status,t.created_at AS "createdAt",t.chain_tx_hash AS "chainTxHash",
-        coalesce((SELECT count(*) FROM trade_confirmations c WHERE c.trade_id=t.id),0)::int AS confirmations
+        coalesce((SELECT count(*) FROM trade_confirmations c WHERE c.trade_id=t.id),0)::int AS confirmations,
+        EXISTS(SELECT 1 FROM trade_confirmations c WHERE c.trade_id=t.id AND c.user_id=$1) AS "hasConfirmed",
+        EXISTS(SELECT 1 FROM evidence e WHERE e.trade_id=t.id) AS "hasEvidence"
        FROM trades t JOIN users b ON b.id=t.buyer_id JOIN users s ON s.id=t.seller_id
        WHERE t.buyer_id=$1 OR t.seller_id=$1
        ORDER BY t.created_at DESC LIMIT 100`, [userId]),
@@ -139,6 +183,7 @@ api.get('/api/bootstrap', asyncRoute(async (request, response) => {
         e.interval_start AS "intervalStart",e.interval_end AS "intervalEnd",e.status,t.public_id AS trade,
         e.rejection_reason AS reason,e.evidence_hash AS "evidenceHash",e.chain_tx_hash AS "chainTxHash",
         e.evidence_reference AS reference,e.evidence_file_sha256 AS "evidenceFileSha256",
+        t.buyer_id=$1 AS "buyerCanReview",t.status AS "tradeStatus",
         EXISTS(SELECT 1 FROM evidence_files ef WHERE ef.evidence_id=e.id) AS "evidenceFileAvailable",
         air.id AS "aiReviewId",air.model AS "aiModel",air.analysis AS "aiReview"
        FROM evidence e JOIN trades t ON t.id=e.trade_id JOIN users s ON s.id=e.submitter_id
@@ -154,6 +199,14 @@ api.get('/api/bootstrap', asyncRoute(async (request, response) => {
         estimate.estimate->>'limitation' AS "estimateLimitation",
         coalesce(sum(c.amount) FILTER (WHERE c.status IN ('simulated','confirmed','pledged')),0) AS raised,
         p.permission_status AS permission,p.notes,p.status,
+        p.revenue_share_json AS "revenueShares",
+        coalesce((
+          SELECT json_agg(json_build_object(
+            'id',d.public_id,'amountMinor',d.amount_minor,'source',d.source,
+            'createdAt',d.created_at,'allocations',d.allocations
+          ) ORDER BY d.created_at DESC)
+          FROM project_income_distributions d WHERE d.project_id=p.id
+        ),'[]'::json) AS "incomeDistributions",
         count(c.id) FILTER (WHERE c.status IN ('simulated','confirmed','pledged'))::int AS "contributionCount"
        FROM projects p
        JOIN solar_funding_estimates estimate ON estimate.project_id=p.id
@@ -171,7 +224,14 @@ api.get('/api/bootstrap', asyncRoute(async (request, response) => {
     ]);
     response.json({
         listings: listings.rows.map((row) => ({ ...row, quantity: Number(row.quantity), price: Number(row.price), window: `${new Date(row.deliveryStart).toLocaleDateString('en-US', { weekday: 'short', hour: '2-digit', minute: '2-digit' })}–${new Date(row.deliveryEnd).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}` })),
-        trades: trades.rows.map((row) => ({ ...row, quantity: Number(row.quantity), price: Number(row.price), status: uiTradeStatus(row.status), time: new Date(row.createdAt).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }), hash: row.chainTxHash ?? 'Not submitted' })),
+        trades: trades.rows.map((row) => ({
+            ...row,
+            quantity: Number(row.quantity),
+            price: Number(row.price),
+            status: uiTradeStatus(row.status === 'evidence_needed' && provider && contractAddress && !row.chainTxHash && !row.hasEvidence ? 'awaiting_buyer_escrow' : row.status),
+            time: new Date(row.createdAt).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' }),
+            hash: row.chainTxHash ?? 'Not submitted',
+        })),
         evidence: evidence.rows.map((row) => ({ ...row, quantity: Number(row.quantity), interval: `${new Date(row.intervalStart).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' })} – ${new Date(row.intervalEnd).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}` })),
         projects: projects.rows.map((row, index) => ({ ...row, area: Number(row.area), capacity: Number(row.capacity), target: Number(row.target), raised: Number(row.raised), image: ['sunrise', 'courtyard', 'hub'][index % 3] })),
         contributions: contributions.rows.map((row) => ({ ...row, amount: Number(row.amount), time: new Date(row.createdAt).toLocaleDateString('en-US', { dateStyle: 'medium' }) })),
@@ -304,7 +364,9 @@ api.post('/api/trades/:id/confirm', requireLinkedWallet, asyncRoute(async (reque
         const confirmations = await client.query('SELECT count(*)::int AS count FROM trade_confirmations WHERE trade_id=$1', [row.id]);
         const status = row.status === 'committed'
             ? 'committed'
-            : confirmations.rows[0].count >= 2 ? 'evidence_needed' : 'awaiting_confirmation';
+            : confirmations.rows[0].count >= 2
+                ? provider && contractAddress ? 'awaiting_buyer_escrow' : 'evidence_needed'
+                : 'awaiting_confirmation';
         await client.query('UPDATE trades SET status=$2,updated_at=now() WHERE id=$1', [row.id, status]);
         await writeAudit(client, request.user.id, 'trade.participant_confirmed', 'trade', routeId(request), { confirmations: confirmations.rows[0].count });
         const otherPartyId = row.buyerId === request.user.id ? row.sellerId : row.buyerId;
@@ -324,7 +386,7 @@ api.post('/api/trades/:id/commitment', requireLinkedWallet, asyncRoute(async (re
     const trade = result.rows[0];
     if (!trade)
         throw new HttpError(404, 'Trade not found.', 'TRADE_NOT_FOUND');
-    if (trade.status !== 'evidence_needed' || trade.chainTxHash)
+    if (!['awaiting_buyer_escrow', 'evidence_needed'].includes(trade.status) || trade.chainTxHash)
         throw new HttpError(409, 'This trade is not awaiting a first on-chain commitment.', 'INVALID_TRADE_STATE');
     if (!trade.buyer || !trade.seller)
         throw new HttpError(409, 'Both trade participants need a registered wallet address.', 'PARTICIPANT_WALLETS_REQUIRED');
@@ -358,7 +420,7 @@ api.post('/api/trades/:id/commitment', requireLinkedWallet, asyncRoute(async (re
         throw new HttpError(422, 'Confirmed transaction does not commit the agreed trade terms.', 'CHAIN_TERMS_MISMATCH');
     }
     const updated = await query(`UPDATE trades SET chain_id=$2,contract_address=$3,chain_tx_hash=$4,status='committed',updated_at=now()
-     WHERE id=$1 AND status='evidence_needed' AND chain_tx_hash IS NULL`, [trade.id, chainId, contractAddress, input.transactionHash]);
+     WHERE id=$1 AND status IN ('awaiting_buyer_escrow','evidence_needed') AND chain_tx_hash IS NULL`, [trade.id, chainId, contractAddress, input.transactionHash]);
     if (!updated.rowCount)
         throw new HttpError(409, 'Trade state changed before the commitment was recorded.', 'INVALID_TRADE_STATE');
     await query('INSERT INTO audit_events(actor_id,event_type,entity_type,entity_id,source,metadata) VALUES($1,$2,$3,$4,$5,$6)', [request.user.id, 'trade.chain_committed', 'trade', trade.publicId, 'blockchain', JSON.stringify({ chainId, transactionHash: input.transactionHash })]);
@@ -373,11 +435,7 @@ api.post('/api/trades/:id/evidence', requireLinkedWallet, receiveEvidenceUpload,
         evidenceReference: z.string().max(500).optional().default(''),
         evidenceFileSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
         aiReviewId: z.string().uuid().optional(),
-        chainTransactionHash: z.string().regex(/^0x[a-fA-F0-9]{64}$/).optional(),
     }).parse(request.body);
-    if (request.user.demoKey && input.chainTransactionHash) {
-        throw new HttpError(400, 'Demo profiles cannot attach unverified wallet transaction receipts.', 'DEMO_CHAIN_ACTION_UNAVAILABLE');
-    }
     const uploadedFile = request.file;
     const inspectedFile = uploadedFile ? inspectEvidenceFile(uploadedFile) : null;
     if (uploadedFile && input.evidenceFileSha256 && input.evidenceFileSha256 !== inspectedFile?.sha256) {
@@ -396,8 +454,10 @@ api.post('/api/trades/:id/evidence', requireLinkedWallet, receiveEvidenceUpload,
             throw new HttpError(404, 'Trade not found.', 'TRADE_NOT_FOUND');
         if (trade.sellerId !== request.user.id)
             throw new HttpError(403, 'Only the energy seller can submit delivery evidence.', 'FORBIDDEN');
-        if (!['committed', 'evidence_needed', 'disputed'].includes(trade.status))
-            throw new HttpError(409, 'Trade is not ready to receive evidence.', 'INVALID_TRADE_STATE');
+        const maySubmitEvidence = trade.status === 'committed' ||
+            (!contractAddress && ['evidence_needed', 'awaiting_buyer_escrow'].includes(trade.status));
+        if (!maySubmitEvidence)
+            throw new HttpError(409, 'The buyer must fund the escrow before the seller can submit delivery evidence.', 'BUYER_ESCROW_REQUIRED');
         if (input.quantity > Number(trade.quantity))
             throw new HttpError(400, 'Evidence quantity cannot exceed the committed trade quantity.', 'EVIDENCE_EXCEEDS_TRADE');
         if (input.aiReviewId) {
@@ -418,25 +478,9 @@ api.post('/api/trades/:id/evidence', requireLinkedWallet, receiveEvidenceUpload,
             reference: input.evidenceReference,
             ...(evidenceFileSha256 ? { evidenceFileSha256 } : {}),
         })));
-        if (contractAddress && !request.user.demoKey) {
-            if (!input.chainTransactionHash)
-                throw new HttpError(409, 'Submit the evidence hash to the configured contract before recording it.', 'CHAIN_EVIDENCE_REQUIRED');
-            const receipt = await provider.getTransactionReceipt(input.chainTransactionHash);
-            const event = receipt?.logs.filter((log) => log.address.toLowerCase() === contractAddress.toLowerCase()).map((log) => { try {
-                return tradingInterface.parseLog(log);
-            }
-            catch {
-                return null;
-            } })
-                .find((item) => item?.name === 'EvidenceSubmitted' && item.args.tradeId === keccak256(toUtf8Bytes(trade.publicId)) && item.args.evidenceHash === evidenceHash);
-            if (!receipt || receipt.status !== 1 || receipt.to?.toLowerCase() !== contractAddress.toLowerCase() ||
-                receipt.from.toLowerCase() !== request.user.walletAddress?.toLowerCase() || !event) {
-                throw new HttpError(422, 'Confirmed contract evidence event does not match the submitted evidence.', 'INVALID_CHAIN_EVIDENCE');
-            }
-        }
         const inserted = await client.query(`INSERT INTO evidence(public_id,trade_id,submitter_id,quantity_kwh,source,interval_start,interval_end,evidence_hash,chain_tx_hash,evidence_reference,evidence_file_sha256,ai_review_id)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-       RETURNING public_id AS id,quantity_kwh AS quantity,source,status,evidence_hash AS "evidenceHash",evidence_reference AS reference,evidence_file_sha256 AS "evidenceFileSha256",ai_review_id AS "aiReviewId"`, [publicId, trade.id, request.user.id, input.quantity, input.source, input.intervalStart, input.intervalEnd, evidenceHash, input.chainTransactionHash ?? null, input.evidenceReference, evidenceFileSha256 ?? null, input.aiReviewId ?? null]);
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,NULL,$9,$10,$11)
+       RETURNING public_id AS id,quantity_kwh AS quantity,source,status,evidence_hash AS "evidenceHash",evidence_reference AS reference,evidence_file_sha256 AS "evidenceFileSha256",ai_review_id AS "aiReviewId"`, [publicId, trade.id, request.user.id, input.quantity, input.source, input.intervalStart, input.intervalEnd, evidenceHash, input.evidenceReference, evidenceFileSha256 ?? null, input.aiReviewId ?? null]);
         if (uploadedFile && inspectedFile) {
             const extension = uploadedFile.originalname.split(/[\\/]/).pop()?.match(/\.[a-zA-Z0-9]+$/)?.[0].toLowerCase();
             if (!extension || !['.jpg', '.jpeg', '.png', '.webp', '.pdf', '.csv'].includes(extension)) {
@@ -446,11 +490,7 @@ api.post('/api/trades/:id/evidence', requireLinkedWallet, receiveEvidenceUpload,
          SELECT id,$2,$3,$4,$5 FROM evidence WHERE public_id=$1`, [publicId, inspectedFile.kind, extension, inspectedFile.sha256, uploadedFile.buffer]);
         }
         await client.query("UPDATE trades SET status='under_review',updated_at=now() WHERE id=$1", [trade.id]);
-        await writeNotification(client, trade.buyerId, `evidence:${publicId}:submitted`, 'Delivery evidence submitted', `${trade.publicId} · ${input.quantity} kWh awaits an authorized review.`, 'Evidence');
-        const reviewers = await client.query(`SELECT id FROM users WHERE role IN ('verifier','admin') AND wallet_address IS NOT NULL AND demo_key IS NULL`);
-        for (const reviewer of reviewers.rows) {
-            await writeNotification(client, reviewer.id, `evidence:${publicId}:review-required`, 'Evidence awaiting review', `${trade.publicId} · ${input.quantity} kWh`, 'Evidence');
-        }
+        await writeNotification(client, trade.buyerId, `evidence:${publicId}:submitted`, 'Delivery evidence needs your review', `${trade.publicId} · ${input.quantity} kWh`, 'Evidence');
         await writeAudit(client, request.user.id, 'evidence.submitted', 'trade', trade.publicId, { evidenceId: publicId, quantityKwh: input.quantity, source: input.source, evidenceHash, fileAttached: Boolean(uploadedFile), evidenceFileSha256: evidenceFileSha256 ?? null });
         return inserted.rows[0];
     });
@@ -489,8 +529,10 @@ api.post('/api/trades/:id/evidence/ai-review', requireLinkedWallet, rateLimit({ 
         throw new HttpError(404, 'Trade not found.', 'TRADE_NOT_FOUND');
     if (trade.sellerId !== request.user.id)
         throw new HttpError(403, 'Only the energy seller can submit delivery evidence.', 'FORBIDDEN');
-    if (!['committed', 'evidence_needed', 'disputed'].includes(trade.status))
-        throw new HttpError(409, 'Trade is not ready to receive evidence.', 'INVALID_TRADE_STATE');
+    const mayReviewEvidence = trade.status === 'committed' ||
+        (!contractAddress && ['evidence_needed', 'awaiting_buyer_escrow'].includes(trade.status));
+    if (!mayReviewEvidence)
+        throw new HttpError(409, 'The buyer must fund the escrow before the seller can submit delivery evidence.', 'BUYER_ESCROW_REQUIRED');
     const result = await reviewEvidenceFile(file, inspected.kind, { tradeId: trade.publicId, quantityKwh: Number(trade.quantity) });
     const saved = await transaction(async (client) => {
         const inserted = await client.query(`INSERT INTO ai_evidence_reviews(trade_id,submitter_id,file_sha256,file_kind,model,analysis)
@@ -500,84 +542,129 @@ api.post('/api/trades/:id/evidence/ai-review', requireLinkedWallet, rateLimit({ 
     });
     response.json({ data: { id: saved.id, fileSha256: inspected.sha256, model: result.model, analysis: result.analysis } });
 }));
-api.post('/api/evidence/:id/review', requireLinkedWallet, allowRoles('verifier', 'admin'), asyncRoute(async (request, response) => {
+api.post('/api/evidence/:id/review', requireLinkedWallet, asyncRoute(async (request, response) => {
     const input = z.object({
         decision: z.enum(['approve', 'reject']),
         reason: z.string().trim().max(500).optional(),
         chainTransactionHash: z.string().regex(/^0x[a-fA-F0-9]{64}$/).optional(),
     }).parse(request.body);
-    if (request.user.demoKey && input.chainTransactionHash) {
-        throw new HttpError(400, 'Demo profiles cannot attach unverified wallet transaction receipts.', 'DEMO_CHAIN_ACTION_UNAVAILABLE');
-    }
     if (input.decision === 'reject' && !input.reason)
-        throw new HttpError(400, 'A rejection reason is required.', 'REJECTION_REASON_REQUIRED');
+        throw new HttpError(400, 'A reason is required when opening or resolving a dispute.', 'REJECTION_REASON_REQUIRED');
     const result = await transaction(async (client) => {
         const current = await client.query(`SELECT e.id,e.trade_id AS "tradeId",t.public_id AS "tradePublicId",t.buyer_id AS "buyerId",t.seller_id AS "sellerId",
-        buyer.wallet_address AS "buyerWallet",t.chain_tx_hash AS "commitTxHash",
-        e.submitter_id AS "submitterId",e.status,e.quantity_kwh AS quantity
-       FROM evidence e JOIN trades t ON t.id=e.trade_id JOIN users buyer ON buyer.id=t.buyer_id
-       WHERE e.public_id=$1 FOR UPDATE OF e,t`, [request.params.id]);
+        t.chain_tx_hash AS "commitTxHash",
+        e.submitter_id AS "submitterId",e.status AS "evidenceStatus",t.status AS "tradeStatus",
+        e.quantity_kwh AS quantity,e.evidence_hash AS "evidenceHash"
+       FROM evidence e JOIN trades t ON t.id=e.trade_id
+       WHERE e.public_id=$1 FOR UPDATE OF e,t`, [routeId(request)]);
         const evidence = current.rows[0];
         if (!evidence)
             throw new HttpError(404, 'Evidence record not found.', 'EVIDENCE_NOT_FOUND');
+        const isBuyer = evidence.buyerId === request.user.id;
+        const isReviewer = ['verifier', 'admin'].includes(request.user.role);
+        const resolvingDispute = isReviewer && evidence.evidenceStatus === 'disputed' && evidence.tradeStatus === 'disputed';
+        if (isBuyer && (evidence.evidenceStatus !== 'pending' || evidence.tradeStatus !== 'under_review')) {
+            throw new HttpError(409, 'Only evidence awaiting buyer review can be accepted or disputed.', 'INVALID_EVIDENCE_STATE');
+        }
+        if (!isBuyer && !resolvingDispute) {
+            throw new HttpError(403, 'The buyer reviews delivery evidence. Verifiers may only resolve an open dispute.', 'FORBIDDEN');
+        }
         if (evidence.submitterId === request.user.id)
-            throw new HttpError(403, 'A verifier cannot approve their own evidence submission.', 'SELF_REVIEW');
-        if (evidence.status !== 'pending')
-            throw new HttpError(409, 'Evidence has already been reviewed.', 'ALREADY_REVIEWED');
+            throw new HttpError(403, 'The evidence submitter cannot review their own evidence.', 'SELF_REVIEW');
         const confirmations = await client.query('SELECT count(*)::int AS count FROM trade_confirmations WHERE trade_id=$1', [evidence.tradeId]);
         if (confirmations.rows[0].count < 2)
             throw new HttpError(409, 'Both trade participants must confirm before evidence can be reviewed.', 'TRADE_CONFIRMATIONS_REQUIRED');
-        const status = input.decision === 'approve' ? 'approved' : 'rejected';
-        if (contractAddress && !request.user.demoKey) {
-            if (!input.chainTransactionHash)
-                throw new HttpError(409, 'Submit the evidence review to the configured contract first.', 'CHAIN_REVIEW_REQUIRED');
+        const hasContract = Boolean(contractAddress && !request.user.demoKey);
+        if (hasContract && !input.chainTransactionHash) {
+            throw new HttpError(409, 'Confirm this decision in your wallet before updating the trade.', 'CHAIN_REVIEW_REQUIRED');
+        }
+        if (hasContract) {
+            if (!provider)
+                throw new HttpError(503, 'The configured blockchain RPC is unavailable.', 'CHAIN_NOT_CONFIGURED');
             const receipt = await provider.getTransactionReceipt(input.chainTransactionHash);
+            const chainTransaction = await provider.getTransaction(input.chainTransactionHash);
+            const tradeHash = keccak256(toUtf8Bytes(evidence.tradePublicId));
             const reasonHash = keccak256(toUtf8Bytes(input.reason ?? ''));
-            const event = receipt?.logs.filter((log) => log.address.toLowerCase() === contractAddress.toLowerCase()).map((log) => { try {
-                return tradingInterface.parseLog(log);
+            const submitted = findTradeEvent(receipt, 'EvidenceSubmitted', tradeHash);
+            const reviewed = findTradeEvent(receipt, 'EvidenceReviewed', tradeHash);
+            const settled = findTradeEvent(receipt, 'TradeSettled', tradeHash);
+            const released = findTradeEvent(receipt, 'TradePaymentReleased', tradeHash);
+            const refunded = findTradeEvent(receipt, 'TradePaymentRefunded', tradeHash);
+            if (!evidence.commitTxHash) {
+                throw new HttpError(409, 'The trade commitment transaction is missing. Contact support before approving this trade.', 'CHAIN_COMMITMENT_REQUIRED');
             }
-            catch {
-                return null;
-            } })
-                .find((item) => item?.name === 'EvidenceReviewed' && item.args.tradeId === keccak256(toUtf8Bytes(evidence.tradePublicId)) && item.args.approved === (input.decision === 'approve') && item.args.reasonHash === reasonHash);
-            if (!receipt || receipt.status !== 1 || receipt.to?.toLowerCase() !== contractAddress.toLowerCase() ||
-                receipt.from.toLowerCase() !== request.user.walletAddress?.toLowerCase() || !event) {
-                throw new HttpError(422, 'Confirmed contract review event does not match the requested decision.', 'INVALID_CHAIN_REVIEW');
+            const commitmentReceipt = await provider.getTransactionReceipt(evidence.commitTxHash);
+            const commitment = findTradeEvent(commitmentReceipt, 'TradeCommitted', tradeHash);
+            const committedBuyer = commitment?.args.buyer;
+            const committedSeller = commitment?.args.seller;
+            if (!commitment || typeof committedBuyer !== 'string' || typeof committedSeller !== 'string') {
+                throw new HttpError(409, 'The original trade participants could not be verified from the commitment transaction.', 'INVALID_CHAIN_COMMITMENT');
             }
-            if (chainId === 11155111 && input.decision === 'reject') {
-                if (!evidence.commitTxHash)
-                    throw new HttpError(409, 'The escrow commitment transaction is missing.', 'CHAIN_COMMITMENT_REQUIRED');
-                const commitmentReceipt = await provider.getTransactionReceipt(evidence.commitTxHash);
-                const commitment = commitmentReceipt?.logs.filter((log) => log.address.toLowerCase() === contractAddress.toLowerCase())
-                    .map((log) => { try {
-                    return tradingInterface.parseLog(log);
+            const expectedSender = isBuyer ? committedBuyer : request.user.walletAddress;
+            const expectedReasonHash = isBuyer && input.decision === 'approve' ? `0x${'0'.repeat(64)}` : reasonHash;
+            if (!receipt || !chainTransaction || receipt.status !== 1 ||
+                receipt.to?.toLowerCase() !== contractAddress.toLowerCase() ||
+                receipt.from.toLowerCase() !== request.user.walletAddress?.toLowerCase() ||
+                chainTransaction.from.toLowerCase() !== expectedSender?.toLowerCase() ||
+                !reviewed || reviewed.args.approved !== (input.decision === 'approve') ||
+                reviewed.args.reasonHash !== expectedReasonHash) {
+                throw new HttpError(422, 'Confirmed contract decision does not match this evidence review.', 'INVALID_CHAIN_REVIEW');
+            }
+            if (isBuyer && (!submitted || submitted.args.evidenceHash !== evidence.evidenceHash)) {
+                throw new HttpError(422, 'The buyer decision is not bound to the submitted evidence record.', 'INVALID_CHAIN_EVIDENCE');
+            }
+            if (input.decision === 'approve' && (!settled ||
+                getAddress(settled.args.buyer) !== getAddress(committedBuyer) ||
+                getAddress(settled.args.seller) !== getAddress(committedSeller))) {
+                throw new HttpError(422, 'The approved evidence transaction did not settle this trade.', 'INVALID_CHAIN_SETTLEMENT');
+            }
+            if (chainId === 11155111 && input.decision === 'approve') {
+                if (!commitment || !released ||
+                    getAddress(released.args.seller) !== getAddress(committedSeller) ||
+                    BigInt(released.args.amountWei) !== BigInt(commitment.args.paymentWei)) {
+                    throw new HttpError(422, 'The transaction did not release the full escrow to the seller.', 'INVALID_CHAIN_PAYMENT');
                 }
-                catch {
-                    return null;
-                } })
-                    .find((item) => item?.name === 'TradeCommitted' && item.args.tradeId === keccak256(toUtf8Bytes(evidence.tradePublicId)));
-                const refund = receipt.logs.filter((log) => log.address.toLowerCase() === contractAddress.toLowerCase()).map((log) => { try {
-                    return tradingInterface.parseLog(log);
-                }
-                catch {
-                    return null;
-                } })
-                    .find((item) => item?.name === 'TradePaymentRefunded' && item.args.tradeId === keccak256(toUtf8Bytes(evidence.tradePublicId)));
-                if (!commitment || !refund || getAddress(refund.args.buyer) !== getAddress(evidence.buyerWallet) ||
-                    BigInt(refund.args.amountWei) !== BigInt(commitment.args.paymentWei)) {
-                    throw new HttpError(422, 'Rejected evidence transaction did not refund escrow to the buyer.', 'INVALID_CHAIN_REFUND');
+            }
+            if (resolvingDispute && input.decision === 'reject' && chainId === 11155111) {
+                if (!commitment || !refunded ||
+                    getAddress(refunded.args.buyer) !== getAddress(committedBuyer) ||
+                    BigInt(refunded.args.amountWei) !== BigInt(commitment.args.paymentWei)) {
+                    throw new HttpError(422, 'The dispute resolution did not refund the full escrow to the buyer.', 'INVALID_CHAIN_REFUND');
                 }
             }
         }
-        await client.query('UPDATE evidence SET status=$2,reviewer_id=$3,rejection_reason=$4,reviewed_at=now(),chain_tx_hash=$5 WHERE id=$1', [evidence.id, status, request.user.id, input.reason ?? null, input.chainTransactionHash ?? null]);
-        await client.query('UPDATE trades SET status=$2,updated_at=now() WHERE id=$1', [evidence.tradeId, input.decision === 'approve' ? 'ready_to_settle' : 'disputed']);
+        const buyerDispute = isBuyer && input.decision === 'reject';
+        const evidenceStatus = buyerDispute ? 'disputed' : input.decision === 'approve' ? 'approved' : 'rejected';
+        const tradeStatus = buyerDispute
+            ? 'disputed'
+            : hasContract
+                ? input.decision === 'approve' ? 'settled' : 'refunded'
+                : input.decision === 'approve' ? 'settled' : 'cancelled';
+        await client.query('UPDATE evidence SET status=$2,reviewer_id=$3,rejection_reason=$4,reviewed_at=now(),chain_tx_hash=$5 WHERE id=$1', [evidence.id, evidenceStatus, isBuyer ? null : request.user.id, input.reason ?? null, input.chainTransactionHash ?? null]);
+        await client.query('UPDATE trades SET status=$2,updated_at=now() WHERE id=$1', [evidence.tradeId, tradeStatus]);
+        if (buyerDispute) {
+            const reviewers = await client.query(`SELECT id FROM users WHERE role IN ('verifier','admin') AND wallet_address IS NOT NULL AND demo_key IS NULL`);
+            for (const reviewer of reviewers.rows) {
+                await writeNotification(client, reviewer.id, `evidence:${routeId(request)}:dispute`, 'Trade dispute needs review', `${evidence.tradePublicId} · ${input.reason}`, 'Evidence');
+            }
+        }
         for (const userId of new Set([evidence.buyerId, evidence.sellerId])) {
             if (userId !== request.user.id) {
-                await writeNotification(client, userId, `evidence:${request.params.id}:reviewed`, `Evidence ${status}`, `${evidence.tradePublicId} · ${input.decision === 'approve' ? 'approved' : 'rejected'} by an authorized reviewer.`, 'Evidence');
+                await writeNotification(client, userId, `evidence:${routeId(request)}:reviewed`, buyerDispute ? 'Trade dispute opened' : `Evidence ${evidenceStatus}`, buyerDispute
+                    ? `${evidence.tradePublicId} · escrow remains locked pending dispute resolution.`
+                    : `${evidence.tradePublicId} · ${input.decision === 'approve' ? 'approved' : 'rejected'} by ${isBuyer ? 'the buyer' : 'an authorized verifier'}.`, 'Evidence');
             }
         }
-        await writeAudit(client, request.user.id, input.decision === 'approve' ? 'evidence.approved' : 'evidence.rejected', 'trade', evidence.tradePublicId, { evidenceId: request.params.id, reason: input.reason });
-        return { evidenceId: request.params.id, tradeId: evidence.tradePublicId, status };
+        if (tradeStatus === 'settled') {
+            const points = Math.max(1, Math.floor(Number(evidence.quantity) * 10));
+            await client.query('INSERT INTO rewards(trade_id,user_id,points) VALUES($1,$2,$3),($1,$4,$3) ON CONFLICT(trade_id,user_id) DO NOTHING', [evidence.tradeId, evidence.sellerId, points, evidence.buyerId]);
+        }
+        await writeAudit(client, request.user.id, `evidence.${evidenceStatus}`, 'trade', evidence.tradePublicId, {
+            evidenceId: routeId(request),
+            reason: input.reason,
+            transactionHash: input.chainTransactionHash ?? null,
+        });
+        return { evidenceId: routeId(request), tradeId: evidence.tradePublicId, evidenceStatus, tradeStatus };
     });
     response.json({ data: result });
 }));
@@ -664,7 +751,14 @@ api.get('/api/projects', asyncRoute(async (_request, response) => {
       estimate.estimate->>'limitation' AS "estimateLimitation",
       coalesce(sum(c.amount) FILTER (WHERE c.status IN ('simulated','confirmed','pledged')),0) AS raised,
       p.permission_status AS permission,p.notes,p.status,p.agreement_version AS "agreementVersion",
-      p.energy_share_json AS "energyShares",p.revenue_share_json AS "revenueShares"
+      p.energy_share_json AS "energyShares",p.revenue_share_json AS "revenueShares",
+      coalesce((
+        SELECT json_agg(json_build_object(
+          'id',d.public_id,'amountMinor',d.amount_minor,'source',d.source,
+          'createdAt',d.created_at,'allocations',d.allocations
+        ) ORDER BY d.created_at DESC)
+        FROM project_income_distributions d WHERE d.project_id=p.id
+      ),'[]'::json) AS "incomeDistributions"
      FROM projects p
      JOIN solar_funding_estimates estimate ON estimate.project_id=p.id
        AND estimate.ai_analysis ? 'summary' AND estimate.estimate ? 'requiredFundingMinor'
@@ -672,10 +766,102 @@ api.get('/api/projects', asyncRoute(async (_request, response) => {
      GROUP BY p.id,u.display_name,estimate.id ORDER BY p.created_at DESC`);
     response.json({ data: result.rows });
 }));
-api.post('/api/projects', asyncRoute(async (request, response) => {
-    if (!['space_owner', 'admin'].includes(request.user.role)) {
-        throw new HttpError(403, 'Choose an energy-host profile to submit a community solar site.', 'ROLE_NOT_ALLOWED');
+api.get('/api/projects/:id/boa', asyncRoute(async (request, response) => {
+    const project = await query('SELECT id,owner_id AS "ownerId" FROM projects WHERE public_id=$1', [routeId(request)]);
+    if (!project.rowCount)
+        throw new HttpError(404, 'Project not found.', 'PROJECT_NOT_FOUND');
+    const [bond, milestones] = await Promise.all([
+        query(`SELECT b.amount_minor AS "amountWei",b.unlock_at AS "unlockAt",b.status,b.post_tx_hash AS "postTxHash",
+        b.release_tx_hash AS "releaseTxHash",b.slashed_minor AS "slashedWei",u.display_name AS operator
+       FROM operator_bonds b JOIN users u ON u.id=b.operator_id WHERE b.project_id=$1`, [project.rows[0].id]),
+        query(`SELECT public_id AS id,title,amount_minor AS "amountWei",sequence_no AS sequence,status,
+        evidence_hash AS "evidenceHash",evidence_reference AS "evidenceReference",
+        reviewed_at AS "reviewedAt" FROM project_milestones WHERE project_id=$1 ORDER BY sequence_no`, [project.rows[0].id]),
+    ]);
+    response.json({ data: { enabled: Boolean(provider && boaContractAddress), bond: bond.rows[0] ?? null, milestones: milestones.rows } });
+}));
+api.post('/api/projects/:id/boa/bond', requireLinkedWallet, asyncRoute(async (request, response) => {
+    const input = z.object({
+        amountWei: z.string().regex(/^[1-9][0-9]{0,30}$/),
+        unlockAt: z.string().datetime(),
+        transactionHash: z.string().regex(/^0x[a-fA-F0-9]{64}$/),
+    }).parse(request.body);
+    if (!boaContractAddress || !provider)
+        throw new HttpError(503, 'The BOA contract and RPC must be configured before posting a bond.', 'BOA_NOT_CONFIGURED');
+    const receipt = await provider.getTransactionReceipt(input.transactionHash);
+    const chainTransaction = await provider.getTransaction(input.transactionHash);
+    const posted = findBoaEvent(receipt, 'BondPosted', routeId(request));
+    if (!receipt || receipt.status !== 1 || chainTransaction?.from.toLowerCase() !== request.user.walletAddress?.toLowerCase() ||
+        receipt.to?.toLowerCase() !== boaContractAddress.toLowerCase() || !posted ||
+        posted.args.operator.toLowerCase() !== request.user.walletAddress?.toLowerCase() ||
+        BigInt(posted.args.amount) !== BigInt(input.amountWei) ||
+        Number(posted.args.unlockAt) !== Math.floor(new Date(input.unlockAt).getTime() / 1000)) {
+        throw new HttpError(422, 'The confirmed BOA bond event does not match this project, operator, amount, or unlock time.', 'INVALID_BOND_TRANSACTION');
     }
+    const result = await transaction(async (client) => {
+        const project = await client.query('SELECT id,owner_id AS "ownerId",public_id AS "publicId" FROM projects WHERE public_id=$1 FOR UPDATE', [routeId(request)]);
+        const row = project.rows[0];
+        if (!row)
+            throw new HttpError(404, 'Project not found.', 'PROJECT_NOT_FOUND');
+        if (row.ownerId !== request.user.id)
+            throw new HttpError(403, 'Only the project owner can post its operator bond.', 'FORBIDDEN');
+        if (new Date(input.unlockAt) <= new Date())
+            throw new HttpError(400, 'The bond unlock time must be in the future.', 'INVALID_UNLOCK_TIME');
+        const existing = await client.query('SELECT 1 FROM operator_bonds WHERE project_id=$1', [row.id]);
+        if (existing.rowCount)
+            throw new HttpError(409, 'This project already has an operator bond.', 'BOND_ALREADY_EXISTS');
+        const bond = await client.query(`INSERT INTO operator_bonds(project_id,operator_id,amount_minor,unlock_at,status,chain_id,contract_address,post_tx_hash)
+       VALUES($1,$2,$3,$4,'locked',$5,$6,$7)
+       RETURNING amount_minor AS "amountWei",unlock_at AS "unlockAt",status,post_tx_hash AS "postTxHash"`, [row.id, request.user.id, input.amountWei, input.unlockAt, chainId, boaContractAddress || null, input.transactionHash]);
+        await client.query(`INSERT INTO project_milestones(public_id,project_id,title,amount_minor,sequence_no)
+       VALUES ($1,$2,'Site due diligence',0,1),($3,$2,'Equipment and installation evidence',0,2),
+              ($4,$2,'Commissioning and meter validation',0,3)
+       ON CONFLICT(project_id,sequence_no) DO NOTHING`, [`MS-${randomUUID().slice(0, 8).toUpperCase()}`, row.id, `MS-${randomUUID().slice(0, 8).toUpperCase()}`, `MS-${randomUUID().slice(0, 8).toUpperCase()}`]);
+        await writeAudit(client, request.user.id, 'project.bond_posted', 'project', row.publicId, { amountWei: input.amountWei, unlockAt: input.unlockAt, transactionHash: input.transactionHash });
+        return bond.rows[0];
+    });
+    response.status(201).json({ data: result });
+}));
+api.post('/api/projects/:id/boa/milestones/:milestoneId/submit', requireLinkedWallet, asyncRoute(async (request, response) => {
+    const input = z.object({ evidenceHash: z.string().regex(/^0x[a-fA-F0-9]{64}$/), evidenceReference: z.string().trim().max(500).optional(), transactionHash: z.string().regex(/^0x[a-fA-F0-9]{64}$/) }).parse(request.body);
+    const milestoneId = z.string().min(1).parse(request.params.milestoneId);
+    if (!boaContractAddress || !provider)
+        throw new HttpError(503, 'The BOA contract and RPC must be configured before submitting evidence.', 'BOA_NOT_CONFIGURED');
+    const receipt = await provider.getTransactionReceipt(input.transactionHash);
+    const event = findBoaEvent(receipt, 'MilestoneSubmitted', routeId(request), milestoneId);
+    if (!receipt || receipt.status !== 1 || receipt.to?.toLowerCase() !== boaContractAddress.toLowerCase() || !event || event.args.evidenceHash !== input.evidenceHash) {
+        throw new HttpError(422, 'The confirmed milestone submission event could not be verified.', 'INVALID_MILESTONE_TRANSACTION');
+    }
+    const result = await query(`UPDATE project_milestones m SET status='submitted',evidence_hash=$1,evidence_reference=$2
+     FROM projects p JOIN operator_bonds b ON b.project_id=p.id
+     WHERE p.public_id=$3 AND m.public_id=$4 AND m.project_id=p.id AND b.operator_id=$5 AND m.status IN ('pending','rejected')
+     RETURNING m.public_id AS id,m.status,m.evidence_hash AS "evidenceHash",m.evidence_reference AS "evidenceReference"`, [input.evidenceHash, input.evidenceReference ?? null, routeId(request), milestoneId, request.user.id]);
+    if (!result.rowCount)
+        throw new HttpError(404, 'Milestone is not available for submission.', 'MILESTONE_NOT_FOUND');
+    response.json({ data: result.rows[0] });
+}));
+api.post('/api/projects/:id/boa/milestones/:milestoneId/review', requireLinkedWallet, asyncRoute(async (request, response) => {
+    if (!['verifier', 'admin'].includes(request.user.role))
+        throw new HttpError(403, 'Only an independent verifier can review operator milestones.', 'FORBIDDEN');
+    const input = z.object({ decision: z.enum(['approve', 'reject']), reason: z.string().trim().max(500).optional(), transactionHash: z.string().regex(/^0x[a-fA-F0-9]{64}$/) }).parse(request.body);
+    const milestoneId = z.string().min(1).parse(request.params.milestoneId);
+    if (input.decision === 'reject' && !input.reason)
+        throw new HttpError(400, 'A reason is required when rejecting evidence.', 'REASON_REQUIRED');
+    if (!boaContractAddress || !provider)
+        throw new HttpError(503, 'The BOA contract and RPC must be configured before reviewing evidence.', 'BOA_NOT_CONFIGURED');
+    const receipt = await provider.getTransactionReceipt(input.transactionHash);
+    const event = findBoaEvent(receipt, 'MilestoneReviewed', routeId(request), milestoneId);
+    if (!receipt || receipt.status !== 1 || receipt.to?.toLowerCase() !== boaContractAddress.toLowerCase() || !event || Boolean(event.args.approved) !== (input.decision === 'approve')) {
+        throw new HttpError(422, 'The confirmed milestone review event could not be verified.', 'INVALID_MILESTONE_TRANSACTION');
+    }
+    const result = await query(`UPDATE project_milestones m SET status=$1,reviewer_id=$2,reviewed_at=now()
+     FROM projects p WHERE p.public_id=$3 AND m.public_id=$4 AND m.project_id=p.id AND m.status='submitted'
+     RETURNING m.public_id AS id,m.status,m.reviewed_at AS "reviewedAt"`, [input.decision === 'approve' ? 'approved' : 'rejected', request.user.id, routeId(request), milestoneId]);
+    if (!result.rowCount)
+        throw new HttpError(404, 'Submitted milestone not found.', 'MILESTONE_NOT_FOUND');
+    response.json({ data: result.rows[0] });
+}));
+api.post('/api/projects', asyncRoute(async (request, response) => {
     const input = z.object({
         name: z.string().trim().min(3).max(120),
         location: z.string().trim().min(2).max(160),
@@ -705,8 +891,6 @@ api.post('/api/projects', asyncRoute(async (request, response) => {
             const savedEstimate = estimate.rows[0];
             if (!savedEstimate)
                 throw new HttpError(404, 'Funding estimate not found or already used.', 'FUNDING_ESTIMATE_NOT_FOUND');
-            if (!savedEstimate.aiModel.trim())
-                throw new HttpError(409, 'A completed AI-reviewed estimate is required before publishing a solar project.', 'FUNDING_ESTIMATE_INCOMPLETE');
             const estimatedShares = savedEstimate.estimatedShares;
             if (Number(savedEstimate.usableAreaM2) !== input.area ||
                 Number(savedEstimate.requiredFundingMinor) !== Math.round(input.target * 100) ||
@@ -758,13 +942,22 @@ api.post('/api/projects/:id/review', allowRoles('verifier', 'admin'), asyncRoute
     });
     response.json({ data: result });
 }));
-api.post('/api/projects/funding-estimates', allowRoles('space_owner', 'admin'), asyncRoute(async (request, response) => {
-    if (request.body?.consentToAi !== true) {
-        throw new HttpError(400, 'Confirm that this project information may be sent to the configured AI provider.', 'AI_REVIEW_CONSENT_REQUIRED');
-    }
+api.post('/api/projects/funding-estimates', asyncRoute(async (request, response) => {
+    const consentToAi = request.body?.consentToAi === true;
     const input = solarFundingInputSchema.parse(request.body);
     const estimate = calculateSolarFunding(input);
-    const review = await reviewSolarFundingPlan(input, estimate);
+    const review = consentToAi
+        ? await reviewSolarFundingPlan(input, estimate)
+        : {
+            model: 'Not requested',
+            analysis: {
+                summary: 'AI review was not requested. Project assumptions are submitted for human review.',
+                confidence: 'low',
+                flags: [],
+                suggestedChecks: ['Review site permission and user-entered cost assumptions.'],
+                suggestedRevenueShares: input.revenueShares,
+            },
+        };
     const saved = await transaction(async (client) => {
         const inserted = await client.query(`INSERT INTO solar_funding_estimates(created_by,input,estimate,ai_model,ai_analysis)
        VALUES($1,$2,$3,$4,$5) RETURNING id`, [request.user.id, JSON.stringify(input), JSON.stringify(estimate), review.model, JSON.stringify(review.analysis)]);
@@ -795,8 +988,9 @@ api.post('/api/projects/:id/contributions', asyncRoute(async (request, response)
         const row = project.rows[0];
         if (!row)
             throw new HttpError(404, 'Project not found.', 'PROJECT_NOT_FOUND');
-        if (row.status !== 'funding')
-            throw new HttpError(409, 'This project is not accepting pledges.', 'PROJECT_NOT_FUNDING');
+        if (!['review', 'funding'].includes(row.status)) {
+            throw new HttpError(409, 'This project is not accepting simulated interest in its current status.', 'PROJECT_NOT_ACCEPTING_INTEREST');
+        }
         const raisedResult = await client.query("SELECT coalesce(sum(amount),0) AS raised FROM contributions WHERE project_id=$1 AND status IN ('simulated','confirmed','pledged')", [row.id]);
         const remaining = Number(row.target) - Number(raisedResult.rows[0].raised);
         if (input.amount > remaining)
@@ -811,6 +1005,62 @@ api.post('/api/projects/:id/contributions', asyncRoute(async (request, response)
         return { ...inserted.rows[0], duplicate: false };
     });
     response.status(result.duplicate ? 200 : 201).json({ data: { ...result, amount: Number(result.amount) } });
+}));
+api.post('/api/projects/:id/income-distributions', asyncRoute(async (request, response) => {
+    const input = z.object({
+        amountUsd: z.number().positive().max(100_000_000),
+        source: z.string().trim().min(3).max(200),
+        idempotencyKey: z.string().uuid(),
+    }).parse(request.body);
+    const amountMinor = Math.round(input.amountUsd * 100);
+    if (!Number.isSafeInteger(amountMinor) || amountMinor <= 0) {
+        throw new HttpError(400, 'Enter a valid simulated income amount in USD.', 'INVALID_INCOME_AMOUNT');
+    }
+    const result = await transaction(async (client) => {
+        const projectResult = await client.query(`SELECT p.id,p.name,u.display_name AS owner,p.status,p.revenue_share_json AS "revenueShares"
+       FROM projects p JOIN users u ON u.id=p.owner_id
+       WHERE p.public_id=$1 FOR UPDATE OF p`, [routeId(request)]);
+        const project = projectResult.rows[0];
+        if (!project)
+            throw new HttpError(404, 'Project not found.', 'PROJECT_NOT_FOUND');
+        if (!['funding', 'operational'].includes(project.status)) {
+            throw new HttpError(409, 'Simulated income can only be recorded for an approved, active project.', 'PROJECT_NOT_ACTIVE');
+        }
+        const prior = await client.query(`SELECT d.public_id AS id,d.project_id AS "projectId",d.amount_minor AS "amountMinor",d.source
+       FROM project_income_distributions d WHERE d.idempotency_key=$1`, [input.idempotencyKey]);
+        if (prior.rows[0]) {
+            const priorRecord = prior.rows[0];
+            if (priorRecord.projectId !== project.id || Number(priorRecord.amountMinor) !== amountMinor || priorRecord.source !== input.source) {
+                throw new HttpError(409, 'This request key was already used for a different income record.', 'IDEMPOTENCY_KEY_REUSED');
+            }
+            return { id: priorRecord.id, duplicate: true };
+        }
+        const contributorResult = await client.query(`SELECT u.id,u.display_name AS name,round(sum(c.amount) * 100)::bigint AS "amountMinor"
+       FROM contributions c JOIN users u ON u.id=c.contributor_id
+       WHERE c.project_id=$1 AND c.status IN ('simulated','confirmed','pledged')
+       GROUP BY u.id,u.display_name ORDER BY u.id`, [project.id]);
+        const allocations = calculateSimulatedIncomeAllocations(amountMinor, project.revenueShares, project.owner, contributorResult.rows.map((investor) => ({
+            id: investor.id,
+            name: investor.name,
+            amountMinor: Number(investor.amountMinor),
+        })));
+        const publicId = `INC-${randomUUID().slice(0, 8).toUpperCase()}`;
+        await client.query(`INSERT INTO project_income_distributions(
+        public_id,project_id,recorded_by,amount_minor,source,revenue_shares,allocations,idempotency_key
+      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [
+            publicId, project.id, request.user.id, amountMinor, input.source,
+            JSON.stringify(project.revenueShares), JSON.stringify(allocations), input.idempotencyKey,
+        ]);
+        await writeAudit(client, request.user.id, 'project.simulated_income_distributed', 'project', routeId(request), {
+            distributionId: publicId,
+            amountMinor,
+            source: input.source,
+            allocations,
+            noPayment: true,
+        });
+        return { id: publicId, duplicate: false };
+    });
+    response.status(result.duplicate ? 200 : 201).json({ data: result });
 }));
 api.get('/api/projects/:id/settlement-preview', asyncRoute(async (request, response) => {
     const result = await query(`SELECT p.public_id AS id,p.agreement_version AS "agreementVersion",p.energy_share_json AS "energyShares",
@@ -894,12 +1144,14 @@ async function writeNotification(client, userId, eventKey, title, detail, page) 
 function uiTradeStatus(status) {
     const labels = {
         awaiting_confirmation: 'Awaiting confirmation',
+        awaiting_buyer_escrow: 'Awaiting buyer escrow',
         committed: 'Evidence needed',
         evidence_needed: 'Evidence needed',
         under_review: 'Under review',
         ready_to_settle: 'Ready to settle',
         disputed: 'Disputed',
         settled: 'Settled',
+        refunded: 'Refunded',
         cancelled: 'Cancelled',
     };
     return labels[status] ?? status;

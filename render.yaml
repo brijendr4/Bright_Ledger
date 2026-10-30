@@ -24,6 +24,8 @@ services:
         sync: false
       - key: CONTRACT_ADDRESS
         sync: false
+      - key: BOA_CONTRACT_ADDRESS
+        sync: false
       - key: CHAIN_ID
         sync: false
       - key: OPENROUTER_API_KEY

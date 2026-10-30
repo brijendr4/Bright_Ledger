@@ -13,5 +13,8 @@ const priceFeed = chainId === 11155111
 const contract = await connection.ethers.deployContract('EnergyTrading', [deployer.address, priceFeed])
 await contract.waitForDeployment()
 console.log(`EnergyTrading deployed to ${await contract.getAddress()}`)
+const boa = await connection.ethers.deployContract('BondedOperatorAssurance', [deployer.address])
+await boa.waitForDeployment()
+console.log(`BondedOperatorAssurance deployed to ${await boa.getAddress()}`)
 console.log(`Owner/verifier: ${deployer.address}`)
 console.log(`ETH/USD price feed: ${priceFeed}`)

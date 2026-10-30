@@ -29,6 +29,7 @@ fi
 cat "$deployment_log"
 
 contract_address=$(sed -n 's/^EnergyTrading deployed to //p' "$deployment_log" | tail -n 1)
+boa_contract_address=$(sed -n 's/^BondedOperatorAssurance deployed to //p' "$deployment_log" | tail -n 1)
 case "$contract_address" in
   0x????????????????????????????????????????) ;;
   *)
@@ -36,9 +37,18 @@ case "$contract_address" in
     exit 1
     ;;
 esac
+case "$boa_contract_address" in
+  0x????????????????????????????????????????) ;;
+  *)
+    echo "Could not read the deployed BondedOperatorAssurance address from Hardhat output." >&2
+    exit 1
+    ;;
+esac
 
 printf '%s\n' "$contract_address" >"${CONTRACT_ADDRESS_FILE}.tmp"
 mv "${CONTRACT_ADDRESS_FILE}.tmp" "$CONTRACT_ADDRESS_FILE"
-echo "Local chain and EnergyTrading contract are ready at $contract_address."
+printf '%s\n' "$boa_contract_address" >"${BOA_CONTRACT_ADDRESS_FILE}.tmp"
+mv "${BOA_CONTRACT_ADDRESS_FILE}.tmp" "$BOA_CONTRACT_ADDRESS_FILE"
+echo "Local chain, EnergyTrading contract, and BondedOperatorAssurance vault are ready."
 
 wait "$chain_pid"

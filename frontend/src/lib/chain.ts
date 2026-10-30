@@ -1,7 +1,7 @@
 import { apiGet, getCurrentUser } from './api'
 import { getActiveEvmWallet } from './wallet'
 
-type ChainConfig = { chain: { enabled: boolean; paymentsEnabled: boolean; chainId: number; contractAddress: string | null } }
+type ChainConfig = { chain: { enabled: boolean; paymentsEnabled: boolean; chainId: number; contractAddress: string | null; boaEnabled: boolean; boaContractAddress: string | null } }
 
 const abi = [
   'function quotePayment(uint64 energyWh,uint128 pricePerKWhScaled) view returns (uint256 paymentWei,uint256 ethUsdPrice)',
@@ -13,6 +13,13 @@ const abi = [
   'function settleTrade(bytes32 tradeId)',
   'function getTrade(bytes32 tradeId) view returns (tuple(address buyer,address seller,uint64 energyWh,uint128 pricePerKWhScaled,uint8 status,bytes32 evidenceHash))',
   'function escrowedWei(bytes32 tradeId) view returns (uint256)',
+]
+
+const boaAbi = [
+  'function postBond(bytes32 projectId,uint64 unlockAt) payable',
+  'function submitMilestone(bytes32 projectId,bytes32 milestoneId,bytes32 evidenceHash)',
+  'function reviewMilestone(bytes32 projectId,bytes32 milestoneId,bool approved,bytes32 reasonHash)',
+  'function releaseBond(bytes32 projectId)',
 ]
 
 async function contractContext() {
@@ -146,4 +153,46 @@ export async function resolveDisputeOnChain(tradeId: string, approved: boolean, 
 export async function settleTradeOnChain(tradeId: string) {
   const { id } = await import('ethers')
   return sendContract('settleTrade', [id(tradeId)])
+}
+
+async function boaContext() {
+  const { BrowserProvider, Contract } = await import('ethers')
+  const wallet = getActiveEvmWallet()
+  if (!wallet) throw new Error('Select an EVM wallet in this browser for the operator bond action.')
+  const { chain } = await apiGet<ChainConfig>('/api/config')
+  if (!chain.boaEnabled || !chain.boaContractAddress) throw new Error('No Bonded Operator Assurance contract is configured.')
+  const provider = new BrowserProvider(wallet)
+  const network = await provider.getNetwork()
+  if (network.chainId !== BigInt(chain.chainId)) throw new Error(`Switch your wallet to the configured chain (ID ${chain.chainId}) and retry.`)
+  const signer = await provider.getSigner()
+  const user = await getCurrentUser()
+  if (!user.walletAddress || signer.address.toLowerCase() !== user.walletAddress.toLowerCase()) throw new Error('The selected wallet does not match this Bright Ledger account.')
+  return { contract: new Contract(chain.boaContractAddress, boaAbi, signer) }
+}
+
+export async function postOperatorBondOnChain(projectId: string, unlockAt: Date, amountWei: bigint) {
+  const { id } = await import('ethers')
+  const { contract } = await boaContext()
+  const tx = await contract.getFunction('postBond')(id(projectId), Math.floor(unlockAt.getTime() / 1000), { value: amountWei })
+  const receipt = await tx.wait()
+  if (!receipt || receipt.status !== 1) throw new Error('The operator bond transaction did not confirm successfully.')
+  return receipt.hash
+}
+
+export async function submitOperatorMilestoneOnChain(projectId: string, milestoneId: string, evidenceHash: string) {
+  const { id } = await import('ethers')
+  const { contract } = await boaContext()
+  const tx = await contract.getFunction('submitMilestone')(id(projectId), id(milestoneId), evidenceHash)
+  const receipt = await tx.wait()
+  if (!receipt || receipt.status !== 1) throw new Error('The milestone transaction did not confirm successfully.')
+  return receipt.hash
+}
+
+export async function reviewOperatorMilestoneOnChain(projectId: string, milestoneId: string, approved: boolean, reason: string) {
+  const { id, keccak256, toUtf8Bytes } = await import('ethers')
+  const { contract } = await boaContext()
+  const tx = await contract.getFunction('reviewMilestone')(id(projectId), id(milestoneId), approved, keccak256(toUtf8Bytes(reason)))
+  const receipt = await tx.wait()
+  if (!receipt || receipt.status !== 1) throw new Error('The milestone review transaction did not confirm successfully.')
+  return receipt.hash
 }

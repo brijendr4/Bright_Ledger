@@ -28,6 +28,7 @@ services:
       CHAIN_RPC_URL: http://127.0.0.1:8545
       CHAIN_ID: "31337"
       CONTRACT_ADDRESS_FILE: /runtime/contract-address
+      BOA_CONTRACT_ADDRESS_FILE: /runtime/boa-contract-address
     ports:
       - "127.0.0.1:8545:8545"
     volumes:
@@ -37,7 +38,7 @@ services:
         - CMD
         - node
         - -e
-        - "fetch('http://127.0.0.1:8545',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',method:'eth_chainId',params:[],id:1})}).then(async r=>{const j=await r.json();if(j.result!=='0x7a69'||!require('fs').existsSync('/runtime/contract-address'))process.exit(1)}).catch(()=>process.exit(1))"
+        - "fetch('http://127.0.0.1:8545',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',method:'eth_chainId',params:[],id:1})}).then(async r=>{const j=await r.json();if(j.result!=='0x7a69'||!require('fs').existsSync('/runtime/contract-address')||!require('fs').existsSync('/runtime/boa-contract-address'))process.exit(1)}).catch(()=>process.exit(1))"
       interval: 5s
       timeout: 3s
       retries: 30
@@ -54,8 +55,9 @@ services:
       - sh
       - -c
       - |
-        while [ ! -s /runtime/contract-address ]; do sleep 1; done
+        while [ ! -s /runtime/contract-address ] || [ ! -s /runtime/boa-contract-address ]; do sleep 1; done
         export CONTRACT_ADDRESS="$$(cat /runtime/contract-address)"
+        export BOA_CONTRACT_ADDRESS="$$(cat /runtime/boa-contract-address)"
         exec npm run dev:backend
     environment:
       API_PORT: "4000"

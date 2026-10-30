@@ -61,6 +61,7 @@ const rpcUrl = process.env.CHAIN_RPC_URL?.trim() || (
     : undefined
 )
 const contractAddress = process.env.CONTRACT_ADDRESS ?? ''
+const boaContractAddress = process.env.BOA_CONTRACT_ADDRESS ?? ''
 const provider = rpcUrl ? new JsonRpcProvider(rpcUrl) : null
 const tradingInterface = new Interface([
   'event TradeCommitted(bytes32 indexed tradeId,address indexed buyer,address indexed seller,uint64 energyWh,uint128 pricePerKWhScaled,uint256 paymentWei)',
@@ -70,11 +71,24 @@ const tradingInterface = new Interface([
   'event TradePaymentReleased(bytes32 indexed tradeId,address indexed seller,uint256 amountWei)',
   'event TradePaymentRefunded(bytes32 indexed tradeId,address indexed buyer,uint256 amountWei)',
 ])
+const boaInterface = new Interface([
+  'event BondPosted(bytes32 indexed projectId,address indexed operator,uint256 amount,uint64 unlockAt)',
+  'event MilestoneSubmitted(bytes32 indexed projectId,bytes32 indexed milestoneId,bytes32 evidenceHash)',
+  'event MilestoneReviewed(bytes32 indexed projectId,bytes32 indexed milestoneId,bool approved,bytes32 reasonHash)',
+])
 function findTradeEvent(receipt: Awaited<ReturnType<NonNullable<typeof provider>['getTransactionReceipt']>>, name: string, tradeId: string) {
   return receipt?.logs
     .filter((log) => log.address.toLowerCase() === contractAddress.toLowerCase())
     .map((log) => { try { return tradingInterface.parseLog(log) } catch { return null } })
     .find((event) => event?.name === name && event.args.tradeId === tradeId)
+}
+function findBoaEvent(receipt: Awaited<ReturnType<NonNullable<typeof provider>['getTransactionReceipt']>>, name: string, projectId: string, milestoneId?: string) {
+  return receipt?.logs
+    .filter((log) => log.address.toLowerCase() === boaContractAddress.toLowerCase())
+    .map((log) => { try { return boaInterface.parseLog(log) } catch { return null } })
+    .find((event) => event?.name === name &&
+      event.args.projectId === keccak256(toUtf8Bytes(projectId)) &&
+      (milestoneId === undefined || event.args.milestoneId === keccak256(toUtf8Bytes(milestoneId))))
 }
 
 api.get('/api/health', asyncRoute(async (_request, response) => {
@@ -138,6 +152,8 @@ api.get('/api/config', (_request, response) => {
       enabled: Boolean(provider && contractAddress),
       paymentsEnabled: chainId === 11155111 && Boolean(provider && contractAddress),
       contractAddress: contractAddress || null,
+      boaEnabled: Boolean(provider && boaContractAddress),
+      boaContractAddress: boaContractAddress || null,
     },
   })
 })
@@ -821,6 +837,117 @@ api.get('/api/projects', asyncRoute(async (_request, response) => {
      GROUP BY p.id,u.display_name,estimate.id ORDER BY p.created_at DESC`,
   )
   response.json({ data: result.rows })
+}))
+
+api.get('/api/projects/:id/boa', asyncRoute(async (request, response) => {
+  const project = await query<{ id: string; ownerId: string }>(
+    'SELECT id,owner_id AS "ownerId" FROM projects WHERE public_id=$1',
+    [routeId(request)],
+  )
+  if (!project.rowCount) throw new HttpError(404, 'Project not found.', 'PROJECT_NOT_FOUND')
+  const [bond, milestones] = await Promise.all([
+    query(
+      `SELECT b.amount_minor AS "amountWei",b.unlock_at AS "unlockAt",b.status,b.post_tx_hash AS "postTxHash",
+        b.release_tx_hash AS "releaseTxHash",b.slashed_minor AS "slashedWei",u.display_name AS operator
+       FROM operator_bonds b JOIN users u ON u.id=b.operator_id WHERE b.project_id=$1`,
+      [project.rows[0].id],
+    ),
+    query(
+      `SELECT public_id AS id,title,amount_minor AS "amountWei",sequence_no AS sequence,status,
+        evidence_hash AS "evidenceHash",evidence_reference AS "evidenceReference",
+        reviewed_at AS "reviewedAt" FROM project_milestones WHERE project_id=$1 ORDER BY sequence_no`,
+      [project.rows[0].id],
+    ),
+  ])
+  response.json({ data: { enabled: Boolean(provider && boaContractAddress), bond: bond.rows[0] ?? null, milestones: milestones.rows } })
+}))
+
+api.post('/api/projects/:id/boa/bond', requireLinkedWallet, asyncRoute(async (request, response) => {
+  const input = z.object({
+    amountWei: z.string().regex(/^[1-9][0-9]{0,30}$/),
+    unlockAt: z.string().datetime(),
+    transactionHash: z.string().regex(/^0x[a-fA-F0-9]{64}$/),
+  }).parse(request.body)
+  if (!boaContractAddress || !provider) throw new HttpError(503, 'The BOA contract and RPC must be configured before posting a bond.', 'BOA_NOT_CONFIGURED')
+  const receipt = await provider.getTransactionReceipt(input.transactionHash)
+  const chainTransaction = await provider.getTransaction(input.transactionHash)
+  const posted = findBoaEvent(receipt, 'BondPosted', routeId(request))
+  if (!receipt || receipt.status !== 1 || chainTransaction?.from.toLowerCase() !== request.user!.walletAddress?.toLowerCase() ||
+    receipt.to?.toLowerCase() !== boaContractAddress.toLowerCase() || !posted ||
+    posted.args.operator.toLowerCase() !== request.user!.walletAddress?.toLowerCase() ||
+    BigInt(posted.args.amount) !== BigInt(input.amountWei) ||
+    Number(posted.args.unlockAt) !== Math.floor(new Date(input.unlockAt).getTime() / 1000)) {
+    throw new HttpError(422, 'The confirmed BOA bond event does not match this project, operator, amount, or unlock time.', 'INVALID_BOND_TRANSACTION')
+  }
+  const result = await transaction(async (client) => {
+    const project = await client.query<{ id: string; ownerId: string; publicId: string }>(
+      'SELECT id,owner_id AS "ownerId",public_id AS "publicId" FROM projects WHERE public_id=$1 FOR UPDATE',
+      [routeId(request)],
+    )
+    const row = project.rows[0]
+    if (!row) throw new HttpError(404, 'Project not found.', 'PROJECT_NOT_FOUND')
+    if (row.ownerId !== request.user!.id) throw new HttpError(403, 'Only the project owner can post its operator bond.', 'FORBIDDEN')
+    if (new Date(input.unlockAt) <= new Date()) throw new HttpError(400, 'The bond unlock time must be in the future.', 'INVALID_UNLOCK_TIME')
+    const existing = await client.query('SELECT 1 FROM operator_bonds WHERE project_id=$1', [row.id])
+    if (existing.rowCount) throw new HttpError(409, 'This project already has an operator bond.', 'BOND_ALREADY_EXISTS')
+    const bond = await client.query(
+      `INSERT INTO operator_bonds(project_id,operator_id,amount_minor,unlock_at,status,chain_id,contract_address,post_tx_hash)
+       VALUES($1,$2,$3,$4,'locked',$5,$6,$7)
+       RETURNING amount_minor AS "amountWei",unlock_at AS "unlockAt",status,post_tx_hash AS "postTxHash"`,
+      [row.id, request.user!.id, input.amountWei, input.unlockAt, chainId, boaContractAddress || null, input.transactionHash],
+    )
+    await client.query(
+      `INSERT INTO project_milestones(public_id,project_id,title,amount_minor,sequence_no)
+       VALUES ($1,$2,'Site due diligence',0,1),($3,$2,'Equipment and installation evidence',0,2),
+              ($4,$2,'Commissioning and meter validation',0,3)
+       ON CONFLICT(project_id,sequence_no) DO NOTHING`,
+      [`MS-${randomUUID().slice(0, 8).toUpperCase()}`, row.id, `MS-${randomUUID().slice(0, 8).toUpperCase()}`, `MS-${randomUUID().slice(0, 8).toUpperCase()}`],
+    )
+    await writeAudit(client, request.user!.id, 'project.bond_posted', 'project', row.publicId, { amountWei: input.amountWei, unlockAt: input.unlockAt, transactionHash: input.transactionHash })
+    return bond.rows[0]
+  })
+  response.status(201).json({ data: result })
+}))
+
+api.post('/api/projects/:id/boa/milestones/:milestoneId/submit', requireLinkedWallet, asyncRoute(async (request, response) => {
+  const input = z.object({ evidenceHash: z.string().regex(/^0x[a-fA-F0-9]{64}$/), evidenceReference: z.string().trim().max(500).optional(), transactionHash: z.string().regex(/^0x[a-fA-F0-9]{64}$/) }).parse(request.body)
+  const milestoneId = z.string().min(1).parse(request.params.milestoneId)
+  if (!boaContractAddress || !provider) throw new HttpError(503, 'The BOA contract and RPC must be configured before submitting evidence.', 'BOA_NOT_CONFIGURED')
+  const receipt = await provider.getTransactionReceipt(input.transactionHash)
+  const event = findBoaEvent(receipt, 'MilestoneSubmitted', routeId(request), milestoneId)
+  if (!receipt || receipt.status !== 1 || receipt.to?.toLowerCase() !== boaContractAddress.toLowerCase() || !event || event.args.evidenceHash !== input.evidenceHash) {
+    throw new HttpError(422, 'The confirmed milestone submission event could not be verified.', 'INVALID_MILESTONE_TRANSACTION')
+  }
+  const result = await query(
+    `UPDATE project_milestones m SET status='submitted',evidence_hash=$1,evidence_reference=$2,submit_tx_hash=$3,review_tx_hash=NULL
+     FROM projects p JOIN operator_bonds b ON b.project_id=p.id
+     WHERE p.public_id=$4 AND m.public_id=$5 AND m.project_id=p.id AND b.operator_id=$6 AND m.status IN ('pending','rejected') AND (m.submit_tx_hash IS NULL OR m.submit_tx_hash <> $3)
+     RETURNING m.public_id AS id,m.status,m.evidence_hash AS "evidenceHash",m.evidence_reference AS "evidenceReference"`,
+    [input.evidenceHash, input.evidenceReference ?? null, input.transactionHash, routeId(request), milestoneId, request.user!.id],
+  )
+  if (!result.rowCount) throw new HttpError(404, 'Milestone is not available for submission.', 'MILESTONE_NOT_FOUND')
+  response.json({ data: result.rows[0] })
+}))
+
+api.post('/api/projects/:id/boa/milestones/:milestoneId/review', requireLinkedWallet, asyncRoute(async (request, response) => {
+  if (!['verifier', 'admin'].includes(request.user!.role)) throw new HttpError(403, 'Only an independent verifier can review operator milestones.', 'FORBIDDEN')
+  const input = z.object({ decision: z.enum(['approve', 'reject']), reason: z.string().trim().max(500).optional(), transactionHash: z.string().regex(/^0x[a-fA-F0-9]{64}$/) }).parse(request.body)
+  const milestoneId = z.string().min(1).parse(request.params.milestoneId)
+  if (input.decision === 'reject' && !input.reason) throw new HttpError(400, 'A reason is required when rejecting evidence.', 'REASON_REQUIRED')
+  if (!boaContractAddress || !provider) throw new HttpError(503, 'The BOA contract and RPC must be configured before reviewing evidence.', 'BOA_NOT_CONFIGURED')
+  const receipt = await provider.getTransactionReceipt(input.transactionHash)
+  const event = findBoaEvent(receipt, 'MilestoneReviewed', routeId(request), milestoneId)
+  if (!receipt || receipt.status !== 1 || receipt.to?.toLowerCase() !== boaContractAddress.toLowerCase() || !event || Boolean(event.args.approved) !== (input.decision === 'approve')) {
+    throw new HttpError(422, 'The confirmed milestone review event could not be verified.', 'INVALID_MILESTONE_TRANSACTION')
+  }
+  const result = await query(
+    `UPDATE project_milestones m SET status=$1,reviewer_id=$3,reviewed_at=now(),review_tx_hash=$2
+     FROM projects p WHERE p.public_id=$4 AND m.public_id=$5 AND m.project_id=p.id AND m.status='submitted' AND m.review_tx_hash IS NULL
+     RETURNING m.public_id AS id,m.status,m.reviewed_at AS "reviewedAt"`,
+    [input.decision === 'approve' ? 'approved' : 'rejected', input.transactionHash, request.user!.id, routeId(request), milestoneId],
+  )
+  if (!result.rowCount) throw new HttpError(404, 'Submitted milestone not found.', 'MILESTONE_NOT_FOUND')
+  response.json({ data: result.rows[0] })
 }))
 
 api.post('/api/projects', asyncRoute(async (request, response) => {
