@@ -20,7 +20,7 @@ const maximumActiveSessions = 5
 
 function walletSignInMessage(input: { address: string; displayName: string; role: (typeof walletRoles)[number]; nonce: string; expiresAt: Date }) {
   const issuedAt = new Date(input.expiresAt.getTime() - 5 * 60_000)
-  return `${process.env.AUTH_DOMAIN ?? 'Bright Ledger'} account sign-in\nURI: ${process.env.AUTH_URI ?? 'http://localhost:5173'}\nVersion: 1\nChain ID: ${Number(process.env.CHAIN_ID ?? 31337)}\nAddress: ${input.address}\nName: ${input.displayName}\nRole: ${input.role}\nNonce: ${input.nonce}\nIssued At: ${issuedAt.toISOString()}\nExpiration Time: ${input.expiresAt.toISOString()}`
+  return `${process.env.AUTH_DOMAIN ?? 'Bright Ledger'} account sign-in\nURI: ${process.env.AUTH_URI ?? 'http://localhost:5173'}\nVersion: 1\nChain ID: ${Number(process.env.CHAIN_ID ?? 11155111)}\nAddress: ${input.address}\nName: ${input.displayName}\nRole: ${input.role}\nNonce: ${input.nonce}\nIssued At: ${issuedAt.toISOString()}\nExpiration Time: ${input.expiresAt.toISOString()}`
 }
 
 async function issueSession(client: import('pg').PoolClient, userId: string, authMethod: 'wallet' | 'password') {

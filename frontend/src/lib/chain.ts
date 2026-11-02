@@ -10,6 +10,7 @@ const abi = [
   'function approveEvidenceAndSettle(bytes32 tradeId,bytes32 evidenceHash)',
   'function raiseDispute(bytes32 tradeId,bytes32 evidenceHash,bytes32 reasonHash)',
   'function resolveDispute(bytes32 tradeId,bool approved,bytes32 reasonHash)',
+  'function verifiers(address account) view returns (bool)',
   'function settleTrade(bytes32 tradeId)',
   'function getTrade(bytes32 tradeId) view returns (tuple(address buyer,address seller,uint64 energyWh,uint128 pricePerKWhScaled,uint8 status,bytes32 evidenceHash))',
   'function escrowedWei(bytes32 tradeId) view returns (uint256)',
@@ -19,15 +20,18 @@ const boaAbi = [
   'function postBond(bytes32 projectId,uint64 unlockAt) payable',
   'function submitMilestone(bytes32 projectId,bytes32 milestoneId,bytes32 evidenceHash)',
   'function reviewMilestone(bytes32 projectId,bytes32 milestoneId,bool approved,bytes32 reasonHash)',
+  'function slashBond(bytes32 projectId,uint256 amount,bytes32 reasonHash)',
   'function releaseBond(bytes32 projectId)',
 ]
 
 async function contractContext() {
-  const { BrowserProvider, Contract } = await import('ethers')
+  const { BrowserProvider, Contract, getAddress, isAddress } = await import('ethers')
   const wallet = getActiveEvmWallet()
   if (!wallet) throw new Error('Select an EVM wallet in this browser for this on-chain action.')
   const { chain } = await apiGet<ChainConfig>('/api/config')
-  if (!chain.enabled || !chain.contractAddress) throw new Error('No deployed trading contract is configured.')
+  if (!chain.enabled || !chain.contractAddress || !isAddress(chain.contractAddress)) {
+    throw new Error('The trading contract address is missing or invalid. Contact the Bright Ledger operator.')
+  }
   const provider = new BrowserProvider(wallet)
   const network = await provider.getNetwork()
   if (network.chainId !== BigInt(chain.chainId)) {
@@ -39,8 +43,8 @@ async function contractContext() {
   if (signer.address.toLowerCase() !== user.walletAddress.toLowerCase()) {
     throw new Error('The selected wallet does not match the EVM wallet linked to this Bright Ledger account.')
   }
-  const contract = new Contract(chain.contractAddress, abi, signer)
-  return { chain, contract, walletAddress: signer.address }
+  const contract = new Contract(getAddress(chain.contractAddress), abi, signer)
+  return { chain, contract, walletAddress: getAddress(signer.address) }
 }
 
 async function sendContractCall(
@@ -114,9 +118,12 @@ export async function commitTradeOnChain(trade: {
   buyerWalletAddress?: string | null
   sellerWalletAddress?: string | null
 }, quotedPaymentWei?: bigint) {
-  const { id } = await import('ethers')
+  const { id, getAddress, isAddress } = await import('ethers')
   if (!trade.buyerWalletAddress || !trade.sellerWalletAddress) {
     throw new Error('Both trade participants must sign in with a wallet before this trade can be committed on-chain.')
+  }
+  if (!isAddress(trade.buyerWalletAddress) || !isAddress(trade.sellerWalletAddress)) {
+    throw new Error('The buyer or seller wallet address is invalid. Relink both EVM wallets before funding escrow.')
   }
   const { chain } = await apiGet<ChainConfig>('/api/config')
   const paymentWei = chain.paymentsEnabled
@@ -124,30 +131,48 @@ export async function commitTradeOnChain(trade: {
     : undefined
   return sendContract('commitTrade', [
     id(trade.id),
-    trade.buyerWalletAddress,
-    trade.sellerWalletAddress,
+    getAddress(trade.buyerWalletAddress),
+    getAddress(trade.sellerWalletAddress),
     BigInt(Math.round(trade.quantity * 1000)),
     BigInt(Math.round(trade.price * 10_000)),
   ], paymentWei === undefined ? undefined : { value: paymentWei })
 }
 
 export async function approveEvidenceOnChain(tradeId: string, evidenceHash: string) {
-  const { id } = await import('ethers')
+  const { id, isHexString } = await import('ethers')
+  if (!isHexString(evidenceHash, 32)) throw new Error('The delivery evidence hash is missing or invalid. Refresh the trade and retry.')
   const context = await contractContext()
   await validateBuyerReview(tradeId, evidenceHash, context)
   return sendContractCall(context.contract, 'approveEvidenceAndSettle', [id(tradeId), evidenceHash])
 }
 
 export async function raiseDisputeOnChain(tradeId: string, evidenceHash: string, reason: string) {
-  const { id, keccak256, toUtf8Bytes } = await import('ethers')
+  const { id, isHexString, keccak256, toUtf8Bytes } = await import('ethers')
+  if (!isHexString(evidenceHash, 32)) throw new Error('The delivery evidence hash is missing or invalid. Refresh the trade and retry.')
   const context = await contractContext()
   await validateBuyerReview(tradeId, evidenceHash, context)
   return sendContractCall(context.contract, 'raiseDispute', [id(tradeId), evidenceHash, keccak256(toUtf8Bytes(reason))])
 }
 
 export async function resolveDisputeOnChain(tradeId: string, approved: boolean, reason: string) {
-  const { id, keccak256, toUtf8Bytes } = await import('ethers')
-  return sendContract('resolveDispute', [id(tradeId), approved, keccak256(toUtf8Bytes(reason))])
+  const { id, keccak256, toUtf8Bytes, ZeroAddress } = await import('ethers')
+  const context = await contractContext()
+  const hash = id(tradeId)
+  const [trade] = await context.contract.getFunction('getTrade')(hash) as [{
+    buyer: string
+    seller: string
+    status: bigint
+  }]
+  if (!trade || trade.buyer === ZeroAddress) {
+    throw new Error(`Trade ${tradeId} has no escrow commitment on the configured contract.`)
+  }
+  if (Number(trade.status) !== 4) {
+    throw new Error(`Trade ${tradeId} is not in the on-chain disputed state and cannot be resolved.`)
+  }
+  if (!(await context.contract.getFunction('verifiers')(context.walletAddress))) {
+    throw new Error('The connected wallet is not an authorized dispute resolver for this escrow contract.')
+  }
+  return sendContractCall(context.contract, 'resolveDispute', [hash, approved, keccak256(toUtf8Bytes(reason))])
 }
 
 export async function settleTradeOnChain(tradeId: string) {
@@ -156,18 +181,20 @@ export async function settleTradeOnChain(tradeId: string) {
 }
 
 async function boaContext() {
-  const { BrowserProvider, Contract } = await import('ethers')
+  const { BrowserProvider, Contract, getAddress, isAddress } = await import('ethers')
   const wallet = getActiveEvmWallet()
   if (!wallet) throw new Error('Select an EVM wallet in this browser for the operator bond action.')
   const { chain } = await apiGet<ChainConfig>('/api/config')
-  if (!chain.boaEnabled || !chain.boaContractAddress) throw new Error('No Bonded Operator Assurance contract is configured.')
+  if (!chain.boaEnabled || !chain.boaContractAddress || !isAddress(chain.boaContractAddress)) {
+    throw new Error('The operator assurance vault address is missing or invalid. Contact the Bright Ledger operator.')
+  }
   const provider = new BrowserProvider(wallet)
   const network = await provider.getNetwork()
   if (network.chainId !== BigInt(chain.chainId)) throw new Error(`Switch your wallet to the configured chain (ID ${chain.chainId}) and retry.`)
   const signer = await provider.getSigner()
   const user = await getCurrentUser()
   if (!user.walletAddress || signer.address.toLowerCase() !== user.walletAddress.toLowerCase()) throw new Error('The selected wallet does not match this Bright Ledger account.')
-  return { contract: new Contract(chain.boaContractAddress, boaAbi, signer) }
+  return { contract: new Contract(getAddress(chain.boaContractAddress), boaAbi, signer) }
 }
 
 export async function postOperatorBondOnChain(projectId: string, unlockAt: Date, amountWei: bigint) {
@@ -180,7 +207,8 @@ export async function postOperatorBondOnChain(projectId: string, unlockAt: Date,
 }
 
 export async function submitOperatorMilestoneOnChain(projectId: string, milestoneId: string, evidenceHash: string) {
-  const { id } = await import('ethers')
+  const { id, isHexString } = await import('ethers')
+  if (!isHexString(evidenceHash, 32)) throw new Error('Milestone evidence must be a valid 32-byte hash.')
   const { contract } = await boaContext()
   const tx = await contract.getFunction('submitMilestone')(id(projectId), id(milestoneId), evidenceHash)
   const receipt = await tx.wait()
@@ -194,5 +222,23 @@ export async function reviewOperatorMilestoneOnChain(projectId: string, mileston
   const tx = await contract.getFunction('reviewMilestone')(id(projectId), id(milestoneId), approved, keccak256(toUtf8Bytes(reason)))
   const receipt = await tx.wait()
   if (!receipt || receipt.status !== 1) throw new Error('The milestone review transaction did not confirm successfully.')
+  return receipt.hash
+}
+
+export async function releaseOperatorBondOnChain(projectId: string) {
+  const { id } = await import('ethers')
+  const { contract } = await boaContext()
+  const tx = await contract.getFunction('releaseBond')(id(projectId))
+  const receipt = await tx.wait()
+  if (!receipt || receipt.status !== 1) throw new Error('The operator bond release transaction did not confirm successfully.')
+  return receipt.hash
+}
+
+export async function slashOperatorBondOnChain(projectId: string, amountWei: bigint, reason: string) {
+  const { id, keccak256, toUtf8Bytes } = await import('ethers')
+  const { contract } = await boaContext()
+  const tx = await contract.getFunction('slashBond')(id(projectId), amountWei, keccak256(toUtf8Bytes(reason)))
+  const receipt = await tx.wait()
+  if (!receipt || receipt.status !== 1) throw new Error('The operator bond slash transaction did not confirm successfully.')
   return receipt.hash
 }

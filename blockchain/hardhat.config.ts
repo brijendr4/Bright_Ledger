@@ -1,5 +1,4 @@
 import dotenv from 'dotenv'
-import { existsSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'hardhat/config'
@@ -7,9 +6,8 @@ import hardhatEthers from '@nomicfoundation/hardhat-ethers'
 import hardhatMocha from '@nomicfoundation/hardhat-mocha'
 
 const moduleDirectory = dirname(fileURLToPath(import.meta.url))
-const localEnvFile = resolve(moduleDirectory, '.env')
 const rootEnvFile = resolve(moduleDirectory, '../.env')
-dotenv.config({ path: existsSync(localEnvFile) ? localEnvFile : rootEnvFile })
+dotenv.config({ path: rootEnvFile })
 
 const baseSepoliaRpcUrl = process.env.BASE_SEPOLIA_RPC_URL || (
   process.env.BASE_SEPOLIA_ALCHEMY_API_KEY

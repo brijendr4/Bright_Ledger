@@ -3,6 +3,21 @@ Version: 1.0
 Date: 30 October 2026  
 Status: Hackathon architecture proposal — not a production legal, financial, or security opinion
 
+## 1.1 Current implementation status
+
+Implemented in the Bright Ledger MVP:
+
+- **Collateralized operator staking:** wallet-linked `consumer`, `prosumer`, or `both` accounts can apply; the site owner accepts one operator; the accepted operator posts the refundable native-token BOA bond.
+- **Milestone assurance:** the accepted operator submits milestone evidence; contract-authorized verifiers approve or reject it; verified bond posting, milestone, release, and slash receipts are persisted with audit events.
+- **Participant coordination:** site owners, accepted operators, and users with recorded project interest can exchange project-scoped messages; notifications and audit entries are created for each message.
+- **Role separation:** the operator cannot review its own milestone, and project participants cannot bypass the contract receipt checks.
+
+Not implemented and intentionally still required before production money or investment claims:
+
+- A real project funding escrow, investor tokenization, payout vault, or cash contribution settlement.
+- Multisig governance, timelocked parameter changes, emergency pause, formal dispute court/arbitration, and independent smart-contract audit.
+- Oracle-backed meter attestations, legal investor eligibility/KYC/AML, insurance, and enforceable off-chain operator agreements.
+
 ## 1. Executive summary
 
 Bright Ledger is a proposed platform for rooftop solar project discovery, pooled project funding, peer-to-peer (P2P) energy allocation/trading, renewable attribute tracking, and transparent settlement.

@@ -7,8 +7,8 @@ import { getAddress, verifyMessage } from 'ethers'
 
 const app = express()
 const port = Number(process.env.API_PORT ?? 4000)
-const chainId = Number(process.env.CHAIN_ID ?? 31337)
-const chainRpcUrl = process.env.CHAIN_RPC_URL ?? ''
+const chainId = Number(process.env.CHAIN_ID ?? 11155111)
+const chainRpcUrl = process.env.CHAIN_RPC_URL ?? 'https://rpc.sepolia.org'
 const databasePath = resolve(process.env.MOCK_DATABASE_PATH ?? 'mock-api/data/bright-ledger.sqlite')
 mkdirSync(dirname(databasePath), { recursive: true })
 const database = new DatabaseSync(databasePath)

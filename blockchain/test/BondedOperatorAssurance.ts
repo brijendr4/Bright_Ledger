@@ -3,6 +3,18 @@ import { describe, it } from 'mocha'
 import { network } from 'hardhat'
 
 describe('BondedOperatorAssurance', function () {
+  it('uses two-step governance transfer and can pause new assurance actions', async function () {
+    const { ethers } = await network.connect()
+    const [governance, successor, operator] = await ethers.getSigners()
+    const contract = await ethers.deployContract('BondedOperatorAssurance', [governance.address])
+    await contract.proposeGovernance(successor.address)
+    await assert.rejects(contract.connect(operator).acceptGovernance())
+    await contract.connect(successor).acceptGovernance()
+    assert.equal(await contract.governance(), successor.address)
+    await contract.connect(successor).setPaused(true)
+    await assert.rejects(contract.connect(operator).postBond(ethers.id('paused-project'), 2_000_000_000n, { value: 1n }))
+  })
+
   it('keeps the operator bond separate and gates release and slashing', async function () {
     const { ethers } = await network.connect()
     const [governance, operator, verifier, outsider] = await ethers.getSigners()

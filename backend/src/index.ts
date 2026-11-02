@@ -1,4 +1,3 @@
-import 'dotenv/config'
 import { migrate, pool } from './db.js'
 import { startServer } from './app.js'
 

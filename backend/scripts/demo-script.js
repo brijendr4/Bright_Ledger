@@ -1,12 +1,10 @@
 import dotenv from 'dotenv'
-import { existsSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url))
-const backendEnvFile = resolve(scriptDirectory, '../.env')
 const rootEnvFile = resolve(scriptDirectory, '../../.env')
-dotenv.config({ path: existsSync(backendEnvFile) ? backendEnvFile : rootEnvFile })
+dotenv.config({ path: rootEnvFile })
 
 async function rpc(method) {
   const response = await fetch(`https://eth-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`, {

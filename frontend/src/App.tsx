@@ -32,7 +32,7 @@ import {
   Zap,
 } from 'lucide-react'
 import { apiGet, apiGetBlob, apiPatch, apiPost, apiUpload, ApiError, authenticatePassword, clearAccessToken, clearLegacyAccessToken, getCurrentUser, hasAccessToken, linkWalletWithSignature, removeWalletAccountWithSignature, revokeWalletSession, signInWallet } from './lib/api'
-import { approveEvidenceOnChain, commitTradeOnChain, getTradePaymentQuote, postOperatorBondOnChain, raiseDisputeOnChain, resolveDisputeOnChain, reviewOperatorMilestoneOnChain, settleTradeOnChain, submitOperatorMilestoneOnChain } from './lib/chain'
+import { approveEvidenceOnChain, commitTradeOnChain, getTradePaymentQuote, postOperatorBondOnChain, raiseDisputeOnChain, releaseOperatorBondOnChain, resolveDisputeOnChain, reviewOperatorMilestoneOnChain, settleTradeOnChain, slashOperatorBondOnChain, submitOperatorMilestoneOnChain } from './lib/chain'
 import { discoverEvmWallets, getActiveEvmWallet, selectEvmWallet, type EvmWalletInfo } from './lib/wallet'
 import './App.css'
 
@@ -107,7 +107,14 @@ type ProjectFundingEstimate = {
   }
 }
 type SettlementPreview = { projectId: string; periodStart: string; periodEnd: string; grossProceedsMinor: number; operatingReserveMinor: number; platformFeeMinor: number; distributablePoolMinor: number; rulesVersion: string; allocations: { recipient: string; type: string; amountMinor: number }[]; inputHash: string; outputHash: string }
-type BoaData = { enabled: boolean; bond: { amountWei: string; unlockAt: string; status: string; postTxHash: string; releaseTxHash?: string | null; slashedWei: string; operator: string } | null; milestones: { id: string; title: string; status: string; evidenceHash?: string | null; evidenceReference?: string | null }[] }
+type BoaData = {
+  enabled: boolean
+  operatorId?: string | null
+  bond: { amountWei: string; unlockAt: string; status: string; postTxHash: string; releaseTxHash?: string | null; slashedWei: string; operator: string; operatorId?: string } | null
+  applications: { id: string; applicant: string; applicantId: string; role: string; status: string; message: string; createdAt: string }[]
+  milestones: { id: string; title: string; status: string; evidenceHash?: string | null; evidenceReference?: string | null }[]
+}
+type ProjectMessage = { id: string; body: string; sender: string; senderId: string; createdAt: string }
 type AppState = { listings: Listing[]; trades: Trade[]; evidence: Evidence[]; projects: Project[]; contributions: Contribution[]; points: number; activity: { title: string; detail: string; time: string }[]; notifications: AppNotification[] }
 type AppNotification = { id: string; title: string; detail: string; page: Page; readAt: string | null; createdAt: string }
 type ApiSnapshot = {
@@ -1344,7 +1351,7 @@ function App() {
           {page === 'Trades' && <Trades trades={filteredTrades} statusFilter={statusFilter} setStatusFilter={setStatusFilter} state={state} role={role} walletAddress={walletAddress} chainPaymentsEnabled={chainPaymentsEnabled} onSettle={settleTrade} onConfirm={confirmTrade} onCommit={commitTrade} onEvidence={(trade) => { setAiEvidenceReview(null); setSelectedTrade(trade); setSelectedEvidence(null); setModal('evidence') }} onReviewEvidence={(item) => { setAiEvidenceReview(null); setSelectedEvidence(item); setSelectedTrade(null); setModal('evidence') }} onCopy={copyText} />}
           {page === 'Evidence' && <EvidencePage evidence={state.evidence} role={role} onReview={(item) => { setAiEvidenceReview(null); setSelectedEvidence(item); setModal('evidence') }} onSelect={(item) => { setAiEvidenceReview(null); setSelectedEvidence(item); setModal('evidence') }} onDownload={(item) => { void downloadEvidenceFile(item) }} />}
           {page === 'Rewards' && <Rewards state={state} />}
-          {page === 'Solar projects' && <Projects projects={filteredProjects} contributions={state.contributions} filter={projectFilter} setFilter={setProjectFilter} onFund={(project) => { setSelectedProject(project); setModal('fund') }} onCreate={() => setModal('project')} onDistributeIncome={distributeProjectIncome} onOpen={setSolarWorkspaceId} workspaceId={solarWorkspaceId} onCloseWorkspace={() => setSolarWorkspaceId('')} role={role} identity={identity} mockApiEnabled={mockApiEnabled} onNotify={notify} onRefresh={refreshFromApi} />}
+          {page === 'Solar projects' && <Projects projects={filteredProjects} contributions={state.contributions} filter={projectFilter} setFilter={setProjectFilter} onFund={(project) => { setSelectedProject(project); setModal('fund') }} onCreate={() => setModal('project')} onDistributeIncome={distributeProjectIncome} onOpen={setSolarWorkspaceId} workspaceId={solarWorkspaceId} onCloseWorkspace={() => setSolarWorkspaceId('')} role={role} identity={identity} accountId={accountId} mockApiEnabled={mockApiEnabled} onNotify={notify} onRefresh={refreshFromApi} />}
           {page === 'Solar projects' && ['Verifier', 'Admin'].includes(role) && <SolarProjectReviewQueue projects={state.projects.filter((project) => project.status === 'Review')} onReview={(project, decision) => { void reviewSolarProject(project, decision) }} />}
           {page === 'Solar projects' && <SolarEstimateTransparency projects={filteredProjects} />}
           {page === 'Activity' && <ActivityPage activity={state.activity} onCopy={copyText} />}
@@ -1884,7 +1891,7 @@ function SolarEstimateTransparency({ projects }: { projects: Project[] }) {
   return <section className="panel list-page-panel"><div className="panel-heading"><div><span className="section-kicker">ESTIMATE PROVENANCE</span><h2>Project cost estimates</h2><p>Cost estimates use submitter-provided assumptions; optional AI review is advisory.</p></div></div><div className="solar-record-list">{projects.map((project) => <div key={project.id}><span><b>{project.name} · {project.estimateReviewConfidence} confidence</b><small>{project.fundingMethodology} · {project.estimateModel === 'Not requested' ? 'AI review not requested' : `assessed by ${project.estimateModel}`}</small><small>{project.estimateReviewSummary}</small><small>{project.estimateLimitation}</small></span></div>)}</div></section>
 }
 
-function Projects({ projects, contributions, filter, setFilter, onFund, onCreate, onDistributeIncome, onOpen, workspaceId, onCloseWorkspace, role, identity, mockApiEnabled, onNotify, onRefresh }: { projects: Project[]; contributions: Contribution[]; filter: string; setFilter: (value: string) => void; onFund: (project: Project) => void; onCreate: () => void; onDistributeIncome: (event: React.FormEvent<HTMLFormElement>, project: Project) => void; onOpen: (projectId: string) => void; workspaceId: string; onCloseWorkspace: () => void; role: Role; identity: string; mockApiEnabled: boolean; onNotify: (message: string) => void; onRefresh: () => Promise<void> }) {
+function Projects({ projects, contributions, filter, setFilter, onFund, onCreate, onDistributeIncome, onOpen, workspaceId, onCloseWorkspace, role, identity, accountId, mockApiEnabled, onNotify, onRefresh }: { projects: Project[]; contributions: Contribution[]; filter: string; setFilter: (value: string) => void; onFund: (project: Project) => void; onCreate: () => void; onDistributeIncome: (event: React.FormEvent<HTMLFormElement>, project: Project) => void; onOpen: (projectId: string) => void; workspaceId: string; onCloseWorkspace: () => void; role: Role; identity: string; accountId: string; mockApiEnabled: boolean; onNotify: (message: string) => void; onRefresh: () => Promise<void> }) {
   return <div className="page-stack">
     <section className="solar-intro">
       <div><span className="section-kicker">COMMUNITY SOLAR · FUNDRAISING</span><h2>Bring a solar project<br />to the community.</h2><p>Project Owners present a solar site and funding goal. Investors can register interest; all contributions shown here are simulated and no money is transferred.</p><button className="button button-primary" data-tour-target="projects" onClick={onCreate}><Plus size={16} /> Create a fundraiser</button></div>
@@ -1902,7 +1909,7 @@ function Projects({ projects, contributions, filter, setFilter, onFund, onCreate
           <div className="funding-amount"><span>{formatUSD(project.raised)} <small>interest recorded</small></span><span>{formatUSD(project.target - project.raised)} <small>goal remaining</small></span></div>
           <button className="button button-secondary project-action" disabled={!['Review', 'Funding'].includes(project.status) || project.raised >= project.target} onClick={() => onFund(project)}>{project.raised >= project.target ? 'Interest goal reached' : project.status === 'Review' ? 'Register interest · pending review' : project.status === 'Funding' ? 'Register investor interest' : 'Interest unavailable'} <ArrowRight size={15} /></button>
           {project.status === 'Review' && <small className="project-review-interest-note">Interest is simulated only. Independent approval is still required before fundraising can proceed.</small>}
-          <BoaPanel project={project} role={role} identity={identity} onNotify={onNotify} />
+          <BoaPanel project={project} role={role} identity={identity} accountId={accountId} onNotify={onNotify} />
           {['Funding', 'Operational'].includes(project.status) && <details className="project-income-panel">
             <summary>Record simulated income & allocate</summary>
             <p>Enter a prototype income amount. Bright Ledger allocates it by the project agreement and records the result; it does not collect or pay money.</p>
@@ -1924,17 +1931,22 @@ function Projects({ projects, contributions, filter, setFilter, onFund, onCreate
   </div>
 }
 
-function BoaPanel({ project, role, identity, onNotify }: { project: Project; role: Role; identity: string; onNotify: (message: string) => void }) {
+function BoaPanel({ project, role, identity, accountId, onNotify }: { project: Project; role: Role; identity: string; accountId: string; onNotify: (message: string) => void }) {
   const [data, setData] = useState<BoaData | null>(null)
+  const [messages, setMessages] = useState<ProjectMessage[]>([])
+  const [message, setMessage] = useState('')
   const [busy, setBusy] = useState(false)
   const [amount, setAmount] = useState('0.01')
   const [unlockAt, setUnlockAt] = useState(() => new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 16))
   const isOwner = project.owner === identity || role === 'Project Owner'
+  const canApply = ['Energy Consumer', 'Energy Producer', 'Producer & Consumer'].includes(role)
   const canVerify = role === 'Verifier' || role === 'Admin'
   const load = useCallback(async () => {
     try {
       const result = await apiGet<{ data: BoaData }>(`/api/projects/${encodeURIComponent(project.id)}/boa`)
+      const messageResult = await apiGet<{ data: ProjectMessage[] }>(`/api/projects/${encodeURIComponent(project.id)}/messages`).catch(() => ({ data: [] }))
       setData(result.data)
+      setMessages(messageResult.data)
     } catch (error) {
       onNotify(error instanceof Error ? error.message : 'Could not load operator assurance status.')
     }
@@ -1953,6 +1965,44 @@ function BoaPanel({ project, role, identity, onNotify }: { project: Project; rol
       onNotify('Operator performance bond locked in the BOA vault. It is separate from project funding.')
     } catch (error) {
       onNotify(error instanceof Error ? error.message : 'Could not post the operator bond.')
+    } finally { setBusy(false) }
+  }
+
+  async function applyAsOperator() {
+    const message = window.prompt('Explain your relevant operating experience and how you will satisfy the project milestones:')
+    if (!message?.trim()) return
+    setBusy(true)
+    try {
+      await apiPost(`/api/projects/${encodeURIComponent(project.id)}/boa/apply`, { message: message.trim() })
+      await load()
+      onNotify('Operator application submitted to the site owner.')
+    } catch (error) {
+      onNotify(error instanceof Error ? error.message : 'Could not submit the operator application.')
+    } finally { setBusy(false) }
+  }
+
+  async function acceptOperator(applicantId: string) {
+    setBusy(true)
+    try {
+      await apiPost(`/api/projects/${encodeURIComponent(project.id)}/boa/applications/${encodeURIComponent(applicantId)}/accept`, {})
+      await load()
+      onNotify('Operator accepted. They can now lock the performance bond.')
+    } catch (error) {
+      onNotify(error instanceof Error ? error.message : 'Could not accept the operator application.')
+    } finally { setBusy(false) }
+  }
+
+  async function sendProjectMessage(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!message.trim()) return
+    setBusy(true)
+    try {
+      const result = await apiPost<{ data: ProjectMessage }>(`/api/projects/${encodeURIComponent(project.id)}/messages`, { body: message.trim() })
+      setMessages((current) => [...current, result.data])
+      setMessage('')
+      onNotify('Project message recorded and participants notified.')
+    } catch (error) {
+      onNotify(error instanceof Error ? error.message : 'Could not send the project message.')
     } finally { setBusy(false) }
   }
 
@@ -1982,13 +2032,41 @@ function BoaPanel({ project, role, identity, onNotify }: { project: Project; rol
     } catch (error) { onNotify(error instanceof Error ? error.message : 'Could not review milestone evidence.') } finally { setBusy(false) }
   }
 
+  async function releaseBond() {
+    setBusy(true)
+    try {
+      const transactionHash = await releaseOperatorBondOnChain(project.id)
+      await apiPost(`/api/projects/${encodeURIComponent(project.id)}/boa/release`, { transactionHash })
+      await load()
+      onNotify('Operator performance bond released after the lock period.')
+    } catch (error) { onNotify(error instanceof Error ? error.message : 'Could not release the operator bond.') } finally { setBusy(false) }
+  }
+
+  async function slashBond() {
+    const amount = window.prompt('Slash amount in SepoliaETH (only use a documented, verified breach):')
+    const reason = window.prompt('Document the verified breach and evidence reference:')
+    if (!amount?.trim() || !reason?.trim()) return
+    setBusy(true)
+    try {
+      const { parseEther } = await import('ethers')
+      const amountWei = parseEther(amount)
+      const transactionHash = await slashOperatorBondOnChain(project.id, amountWei, reason.trim())
+      await apiPost(`/api/projects/${encodeURIComponent(project.id)}/boa/slash`, { amountWei: amountWei.toString(), reason: reason.trim(), transactionHash })
+      await load()
+      onNotify('Operator bond slash recorded with its on-chain transaction.')
+    } catch (error) { onNotify(error instanceof Error ? error.message : 'Could not slash the operator bond.') } finally { setBusy(false) }
+  }
+
   return <details className="boa-panel">
     <summary><ShieldCheck size={14} /> Bonded Operator Assurance <span>{data?.bond ? data.bond.status : 'bond not posted'}</span></summary>
     {!data ? <small>Loading assurance controls…</small> : <>
       <p className="boa-note">The operator bond is a refundable performance bond. Investor/project funding remains in separate records and cannot be withdrawn through this vault.</p>
-      {!data.bond && isOwner && <div className="boa-form"><label>Bond amount (SepoliaETH)<input value={amount} onChange={(event) => setAmount(event.target.value)} inputMode="decimal" min="0.000001" step="0.001" /></label><label>Unlock after<input type="datetime-local" value={unlockAt} onChange={(event) => setUnlockAt(event.target.value)} /></label><button className="button button-secondary" disabled={busy || !data.enabled} onClick={() => void postBond()}>{busy ? 'Waiting for wallet…' : 'Lock operator bond'}</button>{!data.enabled && <small>Configure BOA_CONTRACT_ADDRESS to enable vault transactions.</small>}</div>}
-      {data.bond && <div className="boa-status"><span>Locked bond <b>{data.bond.amountWei} wei</b></span><span>Operator <b>{data.bond.operator}</b></span><span>Unlocks <b>{new Date(data.bond.unlockAt).toLocaleDateString()}</b></span></div>}
-      <div className="boa-milestones">{data.milestones.map((milestone) => <div className="boa-milestone" key={milestone.id}><span><b>{milestone.title}</b><small>{milestone.status}{milestone.evidenceReference ? ` · ${milestone.evidenceReference}` : ''}</small></span>{isOwner && ['pending', 'rejected'].includes(milestone.status) && <button className="text-link" disabled={busy} onClick={() => void submitMilestone(milestone)}>Submit evidence</button>}{canVerify && milestone.status === 'submitted' && <span><button className="text-link" disabled={busy} onClick={() => void reviewMilestone(milestone, 'approve')}>Approve</button><button className="text-link" disabled={busy} onClick={() => void reviewMilestone(milestone, 'reject')}>Reject</button></span>}</div>)}</div>
+      {!data.bond && canApply && !isOwner && <div className="boa-form"><p>Consumer and prosumer accounts can apply to become the bonded project operator. The site owner must accept one application before staking is enabled.</p><button className="button button-secondary" disabled={busy} onClick={() => void applyAsOperator()}>{busy ? 'Submitting…' : 'Apply as bonded operator'}</button></div>}
+      {isOwner && data.applications.filter((application) => application.status === 'pending').map((application) => <div className="boa-application" key={application.id}><span><b>{application.applicant} · {application.role}</b><small>{application.message}</small></span><button className="text-link" disabled={busy} onClick={() => void acceptOperator(application.applicantId)}>Accept operator</button></div>)}
+      {!data.bond && data.operatorId === accountId && <div className="boa-form"><label>Bond amount (SepoliaETH)<input value={amount} onChange={(event) => setAmount(event.target.value)} inputMode="decimal" min="0.000001" step="0.001" /></label><label>Unlock after<input type="datetime-local" value={unlockAt} onChange={(event) => setUnlockAt(event.target.value)} /></label><button className="button button-secondary" disabled={busy || !data.enabled} onClick={() => void postBond()}>{busy ? 'Waiting for wallet…' : 'Lock operator bond'}</button>{!data.enabled && <small>Configure BOA_CONTRACT_ADDRESS to enable vault transactions.</small>}</div>}
+      {data.bond && <div className="boa-status"><span>Locked bond <b>{data.bond.amountWei} wei</b></span><span>Operator <b>{data.bond.operator}</b></span><span>Unlocks <b>{new Date(data.bond.unlockAt).toLocaleDateString()}</b></span>{data.bond.operatorId === accountId && data.bond.status === 'locked' && new Date(data.bond.unlockAt) <= new Date() && <button className="text-link" disabled={busy} onClick={() => void releaseBond()}>Release bond</button>}{canVerify && data.bond.status === 'locked' && <button className="text-link" disabled={busy} onClick={() => void slashBond()}>Slash bond</button>}</div>}
+      <div className="boa-milestones">{data.milestones.map((milestone) => <div className="boa-milestone" key={milestone.id}><span><b>{milestone.title}</b><small>{milestone.status}{milestone.evidenceReference ? ` · ${milestone.evidenceReference}` : ''}</small></span>{data.operatorId === accountId && ['pending', 'rejected'].includes(milestone.status) && <button className="text-link" disabled={busy} onClick={() => void submitMilestone(milestone)}>Submit evidence</button>}{canVerify && milestone.status === 'submitted' && <span><button className="text-link" disabled={busy} onClick={() => void reviewMilestone(milestone, 'approve')}>Approve</button><button className="text-link" disabled={busy} onClick={() => void reviewMilestone(milestone, 'reject')}>Reject</button></span>}</div>)}</div>
+      <div className="boa-communications"><b>Participant communication</b>{messages.length === 0 ? <small>No project messages yet.</small> : messages.map((item) => <div key={item.id}><span><b>{item.sender}</b><small>{new Date(item.createdAt).toLocaleString()}</small></span><p>{item.body}</p></div>)}<form onSubmit={(event) => void sendProjectMessage(event)}><input value={message} onChange={(event) => setMessage(event.target.value)} maxLength={2000} placeholder="Coordinate site, funding, or milestone work" /><button className="button button-outline" disabled={busy || !message.trim()}>Send</button></form></div>
     </>}
   </details>
 }

@@ -19,7 +19,9 @@ contract BondedOperatorAssurance {
         bytes32 evidenceHash;
     }
 
-    address public immutable governance;
+    address public governance;
+    address public pendingGovernance;
+    bool public paused;
     mapping(bytes32 => Bond) public bonds;
     mapping(bytes32 => mapping(bytes32 => Milestone)) public milestones;
     mapping(address => bool) public verifiers;
@@ -34,6 +36,10 @@ contract BondedOperatorAssurance {
     event MilestoneReviewed(bytes32 indexed projectId, bytes32 indexed milestoneId, bool approved, bytes32 reasonHash);
     event BondSlashed(bytes32 indexed projectId, address indexed operator, uint256 amount, bytes32 reasonHash);
     event BondReleased(bytes32 indexed projectId, address indexed operator, uint256 amount);
+    event GovernanceTransferProposed(address indexed currentGovernance, address indexed pendingGovernance);
+    event GovernanceTransferred(address indexed previousGovernance, address indexed newGovernance);
+    event Paused(address indexed account);
+    event Unpaused(address indexed account);
 
     constructor(address initialGovernance) {
         if (initialGovernance == address(0)) revert InvalidInput();
@@ -46,12 +52,37 @@ contract BondedOperatorAssurance {
         _;
     }
 
+    modifier whenNotPaused() {
+        if (paused) revert InvalidState();
+        _;
+    }
+
+    function proposeGovernance(address account) external onlyGovernance {
+        if (account == address(0)) revert InvalidInput();
+        pendingGovernance = account;
+        emit GovernanceTransferProposed(governance, account);
+    }
+
+    function acceptGovernance() external {
+        if (msg.sender != pendingGovernance) revert Unauthorized();
+        address previousGovernance = governance;
+        pendingGovernance = address(0);
+        governance = msg.sender;
+        emit GovernanceTransferred(previousGovernance, msg.sender);
+    }
+
+    function setPaused(bool value) external onlyGovernance {
+        paused = value;
+        if (value) emit Paused(msg.sender);
+        else emit Unpaused(msg.sender);
+    }
+
     function setVerifier(address account, bool enabled) external onlyGovernance {
         if (account == address(0)) revert InvalidInput();
         verifiers[account] = enabled;
     }
 
-    function postBond(bytes32 projectId, uint64 unlockAt) external payable {
+    function postBond(bytes32 projectId, uint64 unlockAt) external payable whenNotPaused {
         if (projectId == bytes32(0) || msg.value == 0 || unlockAt <= block.timestamp) revert InvalidInput();
         Bond storage bond = bonds[projectId];
         if (bond.operator != address(0) || bond.released) revert InvalidState();
@@ -61,7 +92,7 @@ contract BondedOperatorAssurance {
         emit BondPosted(projectId, msg.sender, msg.value, unlockAt);
     }
 
-    function submitMilestone(bytes32 projectId, bytes32 milestoneId, bytes32 evidenceHash) external {
+    function submitMilestone(bytes32 projectId, bytes32 milestoneId, bytes32 evidenceHash) external whenNotPaused {
         Bond storage bond = bonds[projectId];
         if (bond.operator != msg.sender || evidenceHash == bytes32(0)) revert Unauthorized();
         Milestone storage milestone = milestones[projectId][milestoneId];
@@ -71,7 +102,7 @@ contract BondedOperatorAssurance {
         emit MilestoneSubmitted(projectId, milestoneId, evidenceHash);
     }
 
-    function reviewMilestone(bytes32 projectId, bytes32 milestoneId, bool approved, bytes32 reasonHash) external {
+    function reviewMilestone(bytes32 projectId, bytes32 milestoneId, bool approved, bytes32 reasonHash) external whenNotPaused {
         if (!verifiers[msg.sender]) revert Unauthorized();
         Milestone storage milestone = milestones[projectId][milestoneId];
         if (milestone.status != MilestoneStatus.Submitted) revert InvalidState();

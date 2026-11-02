@@ -1,4 +1,4 @@
-import 'dotenv/config'
+import './env.js'
 import { randomUUID } from 'node:crypto'
 import { keccak256, toUtf8Bytes, JsonRpcProvider, Interface, getAddress } from 'ethers'
 import express from 'express'
@@ -54,14 +54,24 @@ function receiveEvidenceUpload(request: express.Request, response: express.Respo
   })
 }
 
-const chainId = Number(process.env.CHAIN_ID ?? 31337)
+const chainId = Number(process.env.CHAIN_ID ?? 11155111)
 const rpcUrl = process.env.CHAIN_RPC_URL?.trim() || (
   chainId === 84532 && process.env.BASE_SEPOLIA_ALCHEMY_API_KEY
     ? `https://base-sepolia.g.alchemy.com/v2/${process.env.BASE_SEPOLIA_ALCHEMY_API_KEY}`
-    : undefined
+    : chainId === 11155111 ? 'https://rpc.sepolia.org' : undefined
 )
-const contractAddress = process.env.CONTRACT_ADDRESS ?? ''
-const boaContractAddress = process.env.BOA_CONTRACT_ADDRESS ?? ''
+function configuredAddress(value: string | undefined, name: string) {
+  const address = value?.trim() ?? ''
+  if (!address) return ''
+  try {
+    return getAddress(address)
+  } catch {
+    throw new Error(`${name} is invalid. Set it to a checksummed EVM contract address.`)
+  }
+}
+
+const contractAddress = configuredAddress(process.env.CONTRACT_ADDRESS, 'CONTRACT_ADDRESS')
+const boaContractAddress = configuredAddress(process.env.BOA_CONTRACT_ADDRESS, 'BOA_CONTRACT_ADDRESS')
 const provider = rpcUrl ? new JsonRpcProvider(rpcUrl) : null
 const tradingInterface = new Interface([
   'event TradeCommitted(bytes32 indexed tradeId,address indexed buyer,address indexed seller,uint64 energyWh,uint128 pricePerKWhScaled,uint256 paymentWei)',
@@ -73,6 +83,8 @@ const tradingInterface = new Interface([
 ])
 const boaInterface = new Interface([
   'event BondPosted(bytes32 indexed projectId,address indexed operator,uint256 amount,uint64 unlockAt)',
+  'event BondSlashed(bytes32 indexed projectId,address indexed operator,uint256 amount,bytes32 reasonHash)',
+  'event BondReleased(bytes32 indexed projectId,address indexed operator,uint256 amount)',
   'event MilestoneSubmitted(bytes32 indexed projectId,bytes32 indexed milestoneId,bytes32 evidenceHash)',
   'event MilestoneReviewed(bytes32 indexed projectId,bytes32 indexed milestoneId,bool approved,bytes32 reasonHash)',
 ])
@@ -840,15 +852,16 @@ api.get('/api/projects', asyncRoute(async (_request, response) => {
 }))
 
 api.get('/api/projects/:id/boa', asyncRoute(async (request, response) => {
-  const project = await query<{ id: string; ownerId: string }>(
-    'SELECT id,owner_id AS "ownerId" FROM projects WHERE public_id=$1',
+  const project = await query<{ id: string; ownerId: string; operatorId: string | null }>(
+    'SELECT id,owner_id AS "ownerId",operator_id AS "operatorId" FROM projects WHERE public_id=$1',
     [routeId(request)],
   )
   if (!project.rowCount) throw new HttpError(404, 'Project not found.', 'PROJECT_NOT_FOUND')
-  const [bond, milestones] = await Promise.all([
+  const [bond, milestones, applications] = await Promise.all([
     query(
       `SELECT b.amount_minor AS "amountWei",b.unlock_at AS "unlockAt",b.status,b.post_tx_hash AS "postTxHash",
-        b.release_tx_hash AS "releaseTxHash",b.slashed_minor AS "slashedWei",u.display_name AS operator
+        b.release_tx_hash AS "releaseTxHash",b.slashed_minor AS "slashedWei",u.display_name AS operator,
+        u.id AS "operatorId"
        FROM operator_bonds b JOIN users u ON u.id=b.operator_id WHERE b.project_id=$1`,
       [project.rows[0].id],
     ),
@@ -858,8 +871,138 @@ api.get('/api/projects/:id/boa', asyncRoute(async (request, response) => {
         reviewed_at AS "reviewedAt" FROM project_milestones WHERE project_id=$1 ORDER BY sequence_no`,
       [project.rows[0].id],
     ),
+    query(
+      `SELECT a.id,a.status,a.message,a.created_at AS "createdAt",u.display_name AS applicant,
+        u.id AS "applicantId",u.role
+       FROM operator_applications a JOIN users u ON u.id=a.applicant_id
+       WHERE a.project_id=$1 ORDER BY a.created_at DESC`,
+      [project.rows[0].id],
+    ),
   ])
-  response.json({ data: { enabled: Boolean(provider && boaContractAddress), bond: bond.rows[0] ?? null, milestones: milestones.rows } })
+  response.json({
+    data: {
+      enabled: Boolean(provider && boaContractAddress),
+      operatorId: project.rows[0].operatorId,
+      bond: bond.rows[0] ?? null,
+      milestones: milestones.rows,
+      applications: applications.rows,
+    },
+  })
+}))
+
+api.post('/api/projects/:id/boa/apply', requireLinkedWallet, asyncRoute(async (request, response) => {
+  if (!['consumer', 'prosumer', 'both'].includes(request.user!.role)) {
+    throw new HttpError(403, 'Only consumer or prosumer accounts can apply as a bonded project operator.', 'OPERATOR_ROLE_REQUIRED')
+  }
+  const input = z.object({ message: z.string().trim().min(10).max(1000) }).parse(request.body)
+  const result = await transaction(async (client) => {
+    const project = await client.query<{ id: string; ownerId: string; status: string }>(
+      'SELECT id,owner_id AS "ownerId",status FROM projects WHERE public_id=$1 FOR UPDATE',
+      [routeId(request)],
+    )
+    const row = project.rows[0]
+    if (!row) throw new HttpError(404, 'Project not found.', 'PROJECT_NOT_FOUND')
+    if (row.ownerId === request.user!.id) throw new HttpError(409, 'The site owner cannot apply as the project operator.', 'OWNER_CANNOT_OPERATE')
+    if (!['funding', 'operational'].includes(row.status)) throw new HttpError(409, 'This project is not accepting operator applications.', 'PROJECT_NOT_ACCEPTING_OPERATOR')
+    const existing = await client.query<{ id: string; status: string }>(
+      `INSERT INTO operator_applications(project_id,applicant_id,message)
+       VALUES($1,$2,$3)
+       ON CONFLICT(project_id,applicant_id) DO UPDATE SET message=EXCLUDED.message,status='pending',reviewed_at=NULL
+       RETURNING id,status`,
+      [row.id, request.user!.id, input.message],
+    )
+    await writeNotification(client, row.ownerId, `project:${routeId(request)}:operator:${request.user!.id}`, 'New operator application', `${request.user!.displayName} applied to provide a collateralized performance bond.`, 'Solar projects')
+    await writeAudit(client, request.user!.id, 'operator.application_submitted', 'project', routeId(request), { messageLength: input.message.length })
+    return existing.rows[0]
+  })
+  response.status(201).json({ data: result })
+}))
+
+api.post('/api/projects/:id/boa/applications/:applicantId/accept', requireLinkedWallet, asyncRoute(async (request, response) => {
+  const applicantId = z.string().uuid().parse(request.params.applicantId)
+  const result = await transaction(async (client) => {
+    const project = await client.query<{ id: string; publicId: string; ownerId: string; operatorId: string | null }>(
+      'SELECT id,public_id AS "publicId",owner_id AS "ownerId",operator_id AS "operatorId" FROM projects WHERE public_id=$1 FOR UPDATE',
+      [routeId(request)],
+    )
+    const row = project.rows[0]
+    if (!row) throw new HttpError(404, 'Project not found.', 'PROJECT_NOT_FOUND')
+    if (row.ownerId !== request.user!.id) throw new HttpError(403, 'Only the site owner can accept an operator application.', 'FORBIDDEN')
+    if (row.operatorId && row.operatorId !== applicantId) throw new HttpError(409, 'This project already has an assigned operator.', 'OPERATOR_ALREADY_ASSIGNED')
+    const applicant = await client.query<{ displayName: string; role: string }>(
+      `SELECT display_name AS "displayName",role FROM users WHERE id=$1 AND role IN ('consumer','prosumer','both') AND wallet_address IS NOT NULL`,
+      [applicantId],
+    )
+    if (!applicant.rowCount) throw new HttpError(404, 'The applicant is not an eligible wallet-linked consumer or prosumer.', 'OPERATOR_NOT_ELIGIBLE')
+    const updated = await client.query(
+      `UPDATE operator_applications SET status='accepted',reviewed_at=now()
+       WHERE project_id=$1 AND applicant_id=$2 AND status='pending'
+       RETURNING id,status`,
+      [row.id, applicantId],
+    )
+    if (!updated.rowCount) throw new HttpError(404, 'Pending operator application not found.', 'APPLICATION_NOT_FOUND')
+    await client.query(`UPDATE operator_applications SET status='rejected',reviewed_at=now() WHERE project_id=$1 AND applicant_id<>$2 AND status='pending'`, [row.id, applicantId])
+    await client.query('UPDATE projects SET operator_id=$2 WHERE id=$1', [row.id, applicantId])
+    await writeNotification(client, applicantId, `project:${row.publicId}:operator-accepted`, 'Operator application accepted', `${row.publicId} · You may now post the operator performance bond.`, 'Solar projects')
+    await writeAudit(client, request.user!.id, 'operator.application_accepted', 'project', row.publicId, { operatorId: applicantId })
+    return updated.rows[0]
+  })
+  response.json({ data: result })
+}))
+
+api.get('/api/projects/:id/messages', asyncRoute(async (request, response) => {
+  const project = await query<{ id: string; ownerId: string; operatorId: string | null }>(
+    'SELECT id,owner_id AS "ownerId",operator_id AS "operatorId" FROM projects WHERE public_id=$1',
+    [routeId(request)],
+  )
+  const row = project.rows[0]
+  if (!row) throw new HttpError(404, 'Project not found.', 'PROJECT_NOT_FOUND')
+  const access = await query<{ allowed: boolean }>(
+    `SELECT EXISTS(
+       SELECT 1 FROM contributions WHERE project_id=$1 AND contributor_id=$2 AND status IN ('simulated','confirmed','pledged')
+       UNION ALL SELECT 1 WHERE $2 IN ($3,$4)
+     ) AS allowed`,
+    [row.id, request.user!.id, row.ownerId, row.operatorId],
+  )
+  if (!access.rows[0].allowed && !['verifier', 'admin'].includes(request.user!.role)) throw new HttpError(403, 'Only project participants can access this project channel.', 'FORBIDDEN')
+  const messages = await query(
+    `SELECT m.id,m.body,m.created_at AS "createdAt",u.display_name AS sender,u.id AS "senderId"
+     FROM project_messages m JOIN users u ON u.id=m.sender_id
+     WHERE m.project_id=$1 ORDER BY m.created_at ASC LIMIT 200`,
+    [row.id],
+  )
+  response.json({ data: messages.rows })
+}))
+
+api.post('/api/projects/:id/messages', asyncRoute(async (request, response) => {
+  const input = z.object({ body: z.string().trim().min(1).max(2000) }).parse(request.body)
+  const result = await transaction(async (client) => {
+    const project = await client.query<{ id: string; ownerId: string; operatorId: string | null }>(
+      'SELECT id,owner_id AS "ownerId",operator_id AS "operatorId" FROM projects WHERE public_id=$1 FOR UPDATE',
+      [routeId(request)],
+    )
+    const row = project.rows[0]
+    if (!row) throw new HttpError(404, 'Project not found.', 'PROJECT_NOT_FOUND')
+    const participant = await client.query(
+      `SELECT 1 WHERE $2 IN ($3,$4)
+       UNION ALL SELECT 1 FROM contributions WHERE project_id=$1 AND contributor_id=$2 AND status IN ('simulated','confirmed','pledged')`,
+      [row.id, request.user!.id, row.ownerId, row.operatorId],
+    )
+    if (!participant.rowCount && !['verifier', 'admin'].includes(request.user!.role)) throw new HttpError(403, 'Only project participants can post in this project channel.', 'FORBIDDEN')
+    const message = await client.query(
+      `INSERT INTO project_messages(project_id,sender_id,body) VALUES($1,$2,$3)
+       RETURNING id,body,created_at AS "createdAt"`,
+      [row.id, request.user!.id, input.body],
+    )
+    const recipients = [row.ownerId, row.operatorId].filter((id): id is string => Boolean(id && id !== request.user!.id))
+    const contributors = await client.query<{ id: string }>('SELECT DISTINCT contributor_id AS id FROM contributions WHERE project_id=$1 AND contributor_id<>$2 AND status IN (\'simulated\',\'confirmed\',\'pledged\')', [row.id, request.user!.id])
+    for (const recipient of new Set([...recipients, ...contributors.rows.map((item) => item.id)])) {
+      await writeNotification(client, recipient, `project:${routeId(request)}:message:${message.rows[0].id}`, 'New project message', `${request.user!.displayName} posted an update in the project channel.`, 'Solar projects')
+    }
+    await writeAudit(client, request.user!.id, 'project.message_posted', 'project', routeId(request), { messageId: message.rows[0].id })
+    return { ...message.rows[0], sender: request.user!.displayName, senderId: request.user!.id }
+  })
+  response.status(201).json({ data: result })
 }))
 
 api.post('/api/projects/:id/boa/bond', requireLinkedWallet, asyncRoute(async (request, response) => {
@@ -880,13 +1023,13 @@ api.post('/api/projects/:id/boa/bond', requireLinkedWallet, asyncRoute(async (re
     throw new HttpError(422, 'The confirmed BOA bond event does not match this project, operator, amount, or unlock time.', 'INVALID_BOND_TRANSACTION')
   }
   const result = await transaction(async (client) => {
-    const project = await client.query<{ id: string; ownerId: string; publicId: string }>(
-      'SELECT id,owner_id AS "ownerId",public_id AS "publicId" FROM projects WHERE public_id=$1 FOR UPDATE',
+    const project = await client.query<{ id: string; ownerId: string; operatorId: string | null; publicId: string }>(
+      'SELECT id,owner_id AS "ownerId",operator_id AS "operatorId",public_id AS "publicId" FROM projects WHERE public_id=$1 FOR UPDATE',
       [routeId(request)],
     )
     const row = project.rows[0]
     if (!row) throw new HttpError(404, 'Project not found.', 'PROJECT_NOT_FOUND')
-    if (row.ownerId !== request.user!.id) throw new HttpError(403, 'Only the project owner can post its operator bond.', 'FORBIDDEN')
+    if (row.operatorId !== request.user!.id || !['consumer', 'prosumer', 'both'].includes(request.user!.role)) throw new HttpError(403, 'Only the accepted consumer or prosumer operator can post this performance bond.', 'OPERATOR_NOT_ASSIGNED')
     if (new Date(input.unlockAt) <= new Date()) throw new HttpError(400, 'The bond unlock time must be in the future.', 'INVALID_UNLOCK_TIME')
     const existing = await client.query('SELECT 1 FROM operator_bonds WHERE project_id=$1', [row.id])
     if (existing.rowCount) throw new HttpError(409, 'This project already has an operator bond.', 'BOND_ALREADY_EXISTS')
@@ -907,6 +1050,74 @@ api.post('/api/projects/:id/boa/bond', requireLinkedWallet, asyncRoute(async (re
     return bond.rows[0]
   })
   response.status(201).json({ data: result })
+}))
+
+api.post('/api/projects/:id/boa/release', requireLinkedWallet, asyncRoute(async (request, response) => {
+  const input = z.object({ transactionHash: z.string().regex(/^0x[a-fA-F0-9]{64}$/) }).parse(request.body)
+  if (!boaContractAddress || !provider) throw new HttpError(503, 'The BOA contract and RPC must be configured before releasing a bond.', 'BOA_NOT_CONFIGURED')
+  const receipt = await provider.getTransactionReceipt(input.transactionHash)
+  const chainTransaction = await provider.getTransaction(input.transactionHash)
+  const event = findBoaEvent(receipt, 'BondReleased', routeId(request))
+  if (!receipt || receipt.status !== 1 || chainTransaction?.from.toLowerCase() !== request.user!.walletAddress?.toLowerCase() ||
+    receipt.to?.toLowerCase() !== boaContractAddress.toLowerCase() || !event ||
+    event.args.operator.toLowerCase() !== request.user!.walletAddress?.toLowerCase()) {
+    throw new HttpError(422, 'The confirmed BOA release event could not be verified.', 'INVALID_BOND_RELEASE')
+  }
+  const result = await transaction(async (client) => {
+    const bond = await client.query<{ id: string; operatorId: string; amountWei: string; status: string }>(
+      `SELECT b.id,b.operator_id AS "operatorId",b.amount_minor AS "amountWei",b.status
+       FROM operator_bonds b JOIN projects p ON p.id=b.project_id WHERE p.public_id=$1 FOR UPDATE`,
+      [routeId(request)],
+    )
+    const row = bond.rows[0]
+    if (!row || row.operatorId !== request.user!.id || row.status === 'released') throw new HttpError(409, 'This operator bond is not available for release.', 'BOND_NOT_RELEASEABLE')
+    const releasedAmount = BigInt(event.args.amount)
+    if (releasedAmount > BigInt(row.amountWei)) throw new HttpError(422, 'The release amount exceeds the recorded bond.', 'INVALID_BOND_RELEASE')
+    await client.query(`UPDATE operator_bonds SET status='released',release_tx_hash=$2 WHERE id=$1`, [row.id, input.transactionHash])
+    await client.query(
+      `INSERT INTO operator_bond_actions(bond_id,action,amount_minor,transaction_hash,actor_id)
+       VALUES($1,'release',$2,$3,$4)`,
+      [row.id, releasedAmount.toString(), input.transactionHash, request.user!.id],
+    )
+    await writeAudit(client, request.user!.id, 'project.bond_released', 'project', routeId(request), { transactionHash: input.transactionHash, amountWei: releasedAmount.toString() })
+    return { status: 'released', amountWei: releasedAmount.toString(), transactionHash: input.transactionHash }
+  })
+  response.json({ data: result })
+}))
+
+api.post('/api/projects/:id/boa/slash', requireLinkedWallet, asyncRoute(async (request, response) => {
+  if (!['verifier', 'admin'].includes(request.user!.role)) throw new HttpError(403, 'Only an independent verifier can slash an operator bond.', 'FORBIDDEN')
+  const input = z.object({ amountWei: z.string().regex(/^[1-9][0-9]{0,30}$/), reason: z.string().trim().min(10).max(500), transactionHash: z.string().regex(/^0x[a-fA-F0-9]{64}$/) }).parse(request.body)
+  if (!boaContractAddress || !provider) throw new HttpError(503, 'The BOA contract and RPC must be configured before slashing a bond.', 'BOA_NOT_CONFIGURED')
+  const receipt = await provider.getTransactionReceipt(input.transactionHash)
+  const chainTransaction = await provider.getTransaction(input.transactionHash)
+  const event = findBoaEvent(receipt, 'BondSlashed', routeId(request))
+  const reasonHash = keccak256(toUtf8Bytes(input.reason))
+  if (!receipt || receipt.status !== 1 || chainTransaction?.from.toLowerCase() !== request.user!.walletAddress?.toLowerCase() ||
+    receipt.to?.toLowerCase() !== boaContractAddress.toLowerCase() || !event ||
+    event.args.operator === undefined || BigInt(event.args.amount) !== BigInt(input.amountWei) || event.args.reasonHash !== reasonHash) {
+    throw new HttpError(422, 'The confirmed BOA slash event could not be verified.', 'INVALID_BOND_SLASH')
+  }
+  const result = await transaction(async (client) => {
+    const bond = await client.query<{ id: string; amountWei: string; slashedWei: string; status: string }>(
+      `SELECT b.id,b.amount_minor AS "amountWei",b.slashed_minor AS "slashedWei",b.status
+       FROM operator_bonds b JOIN projects p ON p.id=b.project_id WHERE p.public_id=$1 FOR UPDATE`,
+      [routeId(request)],
+    )
+    const row = bond.rows[0]
+    const slashAmount = BigInt(input.amountWei)
+    if (!row || row.status === 'released' || slashAmount > BigInt(row.amountWei) - BigInt(row.slashedWei)) throw new HttpError(409, 'The requested slash exceeds the remaining operator bond.', 'INVALID_BOND_SLASH')
+    const totalSlashed = BigInt(row.slashedWei) + slashAmount
+    await client.query(`UPDATE operator_bonds SET slashed_minor=$2,status=CASE WHEN $2 >= amount_minor THEN 'slashed' ELSE status END WHERE id=$1`, [row.id, totalSlashed.toString()])
+    await client.query(
+      `INSERT INTO operator_bond_actions(bond_id,action,amount_minor,reason,transaction_hash,actor_id)
+       VALUES($1,'slash',$2,$3,$4,$5)`,
+      [row.id, slashAmount.toString(), input.reason, input.transactionHash, request.user!.id],
+    )
+    await writeAudit(client, request.user!.id, 'project.bond_slashed', 'project', routeId(request), { transactionHash: input.transactionHash, amountWei: slashAmount.toString(), reason: input.reason })
+    return { status: 'slashed', amountWei: slashAmount.toString(), transactionHash: input.transactionHash }
+  })
+  response.json({ data: result })
 }))
 
 api.post('/api/projects/:id/boa/milestones/:milestoneId/submit', requireLinkedWallet, asyncRoute(async (request, response) => {
